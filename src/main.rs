@@ -1,12 +1,17 @@
+use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
-use bevy::light::{IrradianceVolume, LightProbe};
+use bevy::light::{IrradianceVolume, LightProbe, NotShadowCaster};
 use bevy::picking::events::{PointerClick, PointerOut, PointerOver};
 use bevy::prelude::*;
-use bevy::asset::RenderAssetUsages;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::error_handler::{RenderErrorHandler, RenderErrorPolicy};
+use bevy::render::render_resource::{
+    Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
+};
 use glam::UVec3;
-use muttracer_native::baker::{bake_irradiance_volume, BakeResult, BakeSettings};
+use muttracer_native::baker::{
+    bake_irradiance_volume, render_viewport_pt, BakeResult, BakeSettings, ViewportPtSettings,
+};
 use muttracer_native::bvh::FlatBvh;
 use muttracer_native::gpu::GpuContext;
 use muttracer_native::scene::Scene as NativeScene;
@@ -45,7 +50,7 @@ pub const SCENES: &[SceneEntry] = &[
         bounds_min: Vec3::new(-556.0, 0.0, -559.2),
         bounds_max: Vec3::new(0.0, 548.8, 0.0),
         cam_center: Vec3::new(-4.17, 4.11, -4.19),
-        cam_dist: 16.0,
+        cam_dist: 14.0,
         triangle_count: 36,
     },
     SceneEntry {
@@ -86,8 +91,17 @@ pub struct AppState {
     pub is_baking: bool,
     pub status_text: String,
     pub baked_result: Option<BakeResult>,
+    pub baked_image_handle: Option<Handle<Image>>,
+    pub gpu_ready_frames: u32,
     pub bake_tx: Sender<BakeTask>,
     pub bake_rx: Mutex<Receiver<BakeTaskResult>>,
+    pub pt_image_handle: Option<Handle<Image>>,
+    pub pt_task_tx: Sender<ViewportPtTask>,
+    pub pt_res_rx: Mutex<Receiver<ViewportPtResult>>,
+    pub pt_pending: bool,
+    pub pt_accum_frames: u32,
+    pub last_cam_eye: Vec3,
+    pub last_cam_center: Vec3,
 }
 
 pub struct BakeTask {
@@ -99,6 +113,28 @@ pub enum BakeTaskResult {
     Success(BakeResult),
     Error(String),
 }
+
+pub struct ViewportPtTask {
+    pub scene_path: PathBuf,
+    pub eye: Vec3,
+    pub forward: Vec3,
+    pub right: Vec3,
+    pub up: Vec3,
+    pub width: u32,
+    pub height: u32,
+    pub spp: u32,
+    pub max_bounces: u32,
+    pub seed: u32,
+}
+
+pub struct ViewportPtResult {
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Component)]
+pub struct PathTraceViewportOverlay;
 
 #[derive(Resource)]
 pub struct ImportChannel {
@@ -151,6 +187,71 @@ pub struct InfoLabel;
 #[derive(Component)]
 pub struct SceneModelRoot;
 
+#[derive(Component)]
+pub struct MainSunLight;
+
+fn copy_model_assets(source_file: &Path, dest_folder: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dest_folder)?;
+    let file_name = source_file.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing file name")
+    })?;
+    let dest_file = dest_folder.join(file_name);
+    let _ = std::fs::copy(source_file, &dest_file);
+
+    let is_gltf = source_file
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("gltf"))
+        .unwrap_or(false);
+
+    if is_gltf {
+        if let Some(parent) = source_file.parent() {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    let name = entry.file_name();
+                    if entry_path == source_file {
+                        continue;
+                    }
+                    if let Ok(ft) = entry.file_type() {
+                        if ft.is_dir() {
+                            let sub_dest = dest_folder.join(&name);
+                            let _ = copy_dir_recursive(&entry_path, &sub_dest);
+                        } else if ft.is_file() {
+                            if let Some(ext) = entry_path.extension().and_then(|e| e.to_str()) {
+                                let ext_lower = ext.to_lowercase();
+                                if matches!(
+                                    ext_lower.as_str(),
+                                    "bin" | "png" | "jpg" | "jpeg" | "webp" | "ktx2" | "hdr"
+                                ) {
+                                    let _ = std::fs::copy(&entry_path, dest_folder.join(&name));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(dest_file)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            let _ = std::fs::copy(entry.path(), target);
+        }
+    }
+    Ok(())
+}
+
 fn find_assets_dir() -> String {
     let candidates = [
         "assets",
@@ -166,10 +267,40 @@ fn find_assets_dir() -> String {
     "assets".to_string()
 }
 
+fn resolve_scene_path(path_str: &str) -> PathBuf {
+    let p = Path::new(path_str);
+    if p.is_absolute() && p.exists() {
+        return p.to_path_buf();
+    }
+    let assets_dir = PathBuf::from(find_assets_dir());
+    let candidate = assets_dir.join(path_str);
+    if candidate.exists() {
+        return candidate;
+    }
+    if p.exists() {
+        return p.to_path_buf();
+    }
+    for prefix in &["mutbaker-gui/assets", "assets", "C:/tracer-experiment/mutbaker-gui/assets"] {
+        let c = Path::new(prefix).join(path_str);
+        if c.exists() {
+            return c;
+        }
+    }
+    candidate
+}
+
 fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("PANIC: {info}\nBacktrace:\n{:?}", std::backtrace::Backtrace::capture());
+        eprintln!("{msg}");
+        let _ = std::fs::write("crash_log.txt", &msg);
+    }));
+
     let (bake_task_tx, bake_task_rx) = channel::<BakeTask>();
     let (bake_res_tx, bake_res_rx) = channel::<BakeTaskResult>();
     let (import_tx, import_rx) = channel::<PathBuf>();
+    let (pt_task_tx, pt_task_rx) = channel::<ViewportPtTask>();
+    let (pt_res_tx, pt_res_rx) = channel::<ViewportPtResult>();
 
     // Background worker for GPU baking
     std::thread::spawn(move || {
@@ -185,9 +316,78 @@ fn main() {
         }
     });
 
+    // Background worker for real-time Viewport Path Tracing Preview
+    std::thread::spawn(move || {
+        let Ok(gpu) = GpuContext::new_dx12() else {
+            eprintln!("[viewport-pt] Failed to initialize DX12 GPU Context");
+            return;
+        };
+
+        let mut cached_path: Option<PathBuf> = None;
+        let mut cached_bvh: Option<FlatBvh> = None;
+
+        while let Ok(task) = pt_task_rx.recv() {
+            let mut latest_task = task;
+            while let Ok(newer) = pt_task_rx.try_recv() {
+                latest_task = newer;
+            }
+
+            let need_reload = match &cached_path {
+                Some(p) => p != &latest_task.scene_path,
+                None => true,
+            };
+
+            if need_reload {
+                match NativeScene::load_gltf(&latest_task.scene_path) {
+                    Ok(scene) => {
+                        cached_bvh = Some(FlatBvh::build(&scene));
+                        cached_path = Some(latest_task.scene_path.clone());
+                    }
+                    Err(e) => {
+                        eprintln!("[viewport-pt] Failed to load scene {}: {e:#}", latest_task.scene_path.display());
+                    }
+                }
+            }
+
+            if let Some(ref bvh) = cached_bvh {
+                let settings = ViewportPtSettings {
+                    eye: latest_task.eye,
+                    forward: latest_task.forward,
+                    right: latest_task.right,
+                    up: latest_task.up,
+                    width: latest_task.width,
+                    height: latest_task.height,
+                    spp: latest_task.spp,
+                    max_bounces: latest_task.max_bounces,
+                    seed: latest_task.seed,
+                };
+
+                if let Ok(pixels) = render_viewport_pt(&gpu, bvh, &settings) {
+                    let _ = pt_res_tx.send(ViewportPtResult {
+                        pixels,
+                        width: latest_task.width,
+                        height: latest_task.height,
+                    });
+                }
+            }
+        }
+    });
+
     let default_scene = &SCENES[0];
 
     App::new()
+        .insert_resource(RenderErrorHandler(|error, _main_world, _render_world| {
+            let msg = format!(
+                "RENDER ERROR ({:?}): {}\nSource: {:?}\n------------------------\n",
+                error.ty, error.description, error.source
+            );
+            eprintln!("{msg}");
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("C:/tracer-experiment/render_error.txt") {
+                let _ = f.write_all(msg.as_bytes());
+            }
+            RenderErrorPolicy::Ignore
+        }))
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
@@ -221,16 +421,29 @@ fn main() {
             show_probe_grid: true,
             use_baked_raster: false,
             is_baking: false,
-            status_text: "Ready | Qualcomm Adreno 8cx Gen 3 (DX12)".into(),
+            status_text: "Mode: Path Tracing Preview (Real-time GPU Path Tracer)".into(),
             baked_result: None,
+            baked_image_handle: None,
+            gpu_ready_frames: 0,
             bake_tx: bake_task_tx,
             bake_rx: Mutex::new(bake_res_rx),
+            pt_image_handle: None,
+            pt_task_tx,
+            pt_res_rx: Mutex::new(pt_res_rx),
+            pt_pending: false,
+            pt_accum_frames: 0,
+            last_cam_eye: Vec3::ZERO,
+            last_cam_center: Vec3::ZERO,
         })
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
+                advance_gpu_frame_counter,
                 orbit_camera_controller,
+                dispatch_viewport_pt_system,
+                poll_viewport_pt_results,
+                sync_viewport_mode_visibilities,
                 sync_probe_spheres,
                 draw_probe_gizmos,
                 sync_baked_irradiance_volume,
@@ -246,6 +459,12 @@ fn main() {
         .run();
 }
 
+fn advance_gpu_frame_counter(mut state: ResMut<AppState>) {
+    if state.baked_image_handle.is_some() && state.gpu_ready_frames < 10 {
+        state.gpu_ready_frames += 1;
+    }
+}
+
 fn run_gpu_bake(task: BakeTask) -> anyhow::Result<BakeResult> {
     let gpu = GpuContext::new_dx12()?;
     let scene = NativeScene::load_gltf(&task.scene_path)?;
@@ -258,13 +477,15 @@ fn setup(
     assets: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut state: ResMut<AppState>,
 ) {
     let sc = &SCENES[0];
     let cam = OrbitCamera {
         center: sc.cam_center,
-        distance: sc.cam_dist,
-        yaw: 0.8,
-        pitch: 0.35,
+        distance: 14.5,
+        yaw: 0.85, // 3/4 elevated isometric view showcasing ceiling aperture and floor sunlight patch
+        pitch: 0.30,
     };
     let pos = cam.center
         + Vec3::new(
@@ -283,21 +504,67 @@ fn setup(
         IsDefaultUiCamera,
     ));
 
-    // Directional Sunlight & Ambient Light
+    // Directional Sunlight & Ambient Light - sharp, bright aperture lighting
     commands.spawn((
         DirectionalLight {
             shadow_maps_enabled: true,
-            illuminance: 12000.0,
+            illuminance: 16000.0,
+            shadow_depth_bias: 0.02,
+            shadow_normal_bias: 1.8,
             ..default()
         },
         Transform::from_xyz(20.0, 50.0, 30.0).looking_at(sc.cam_center, Vec3::Y),
+        MainSunLight,
     ));
 
     commands.insert_resource(GlobalAmbientLight {
         color: Color::WHITE,
-        brightness: 800.0,
+        brightness: 350.0,
         ..default()
     });
+
+    // Persistent BakedIrradianceVolume entity (components added/removed without despawning)
+    let center = (sc.bounds_min + sc.bounds_max) * 0.5 * sc.visual_scale;
+    let size = (sc.bounds_max - sc.bounds_min) * sc.visual_scale;
+    commands.spawn((
+        Transform::from_translation(center).with_scale(size * 1.15),
+        Visibility::default(),
+        LightProbe {
+            falloff: Vec3::splat(0.05),
+            ..default()
+        },
+        BakedIrradianceVolume,
+    ));
+
+    // Viewport Path Tracing Overlay Image (covers viewport between top bar and right panel)
+    let pt_img = Image::new_fill(
+        Extent3d {
+            width: 480,
+            height: 380,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[17, 18, 20, 255],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::all(),
+    );
+    let pt_handle = images.add(pt_img);
+    state.pt_image_handle = Some(pt_handle.clone());
+
+    commands.spawn((
+        ImageNode::new(pt_handle),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(42.0),
+            left: Val::Px(0.0),
+            right: Val::Px(320.0),
+            bottom: Val::Px(0.0),
+            ..default()
+        },
+        Visibility::Inherited,
+        PathTraceViewportOverlay,
+        Pickable::IGNORE,
+    ));
 
     // Shared white probe debug mesh and material
     let probe_mesh = meshes.add(Sphere::new(1.0).mesh().uv(24, 14));
@@ -314,7 +581,7 @@ fn setup(
     });
 
     // Spawn Initial Scene Model
-    spawn_scene_model(&mut commands, &assets, sc.asset_path, sc.visual_scale);
+    spawn_scene_model(&mut commands, &assets, sc.asset_path, sc.visual_scale, state.use_baked_raster);
 
     // Build MuTracer-style UI Overlay
     build_ui(&mut commands);
@@ -325,10 +592,17 @@ fn spawn_scene_model(
     assets: &AssetServer,
     path: &str,
     scale: f32,
+    use_baked_raster: bool,
 ) {
+    let vis = if use_baked_raster {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
     commands.spawn((
         WorldAssetRoot(assets.load(GltfAssetLabel::Scene(0).from_asset(path.to_string()))),
         Transform::from_scale(Vec3::splat(scale)),
+        vis,
         SceneModelRoot,
     ));
 }
@@ -650,7 +924,9 @@ fn handle_ui_click(
     import_channel: Res<ImportChannel>,
     mut state: ResMut<AppState>,
     scene_model_query: Query<Entity, With<SceneModelRoot>>,
-    mut cam_query: Query<(&mut Transform, &mut OrbitCamera)>,
+    mut cam_query: Query<(&mut Transform, &mut OrbitCamera), (Without<SceneModelRoot>, Without<MainSunLight>)>,
+    volume_query: Query<(Entity, Option<&IrradianceVolume>), With<BakedIrradianceVolume>>,
+    mut dir_light_query: Query<&mut Transform, (With<MainSunLight>, Without<OrbitCamera>, Without<SceneModelRoot>)>,
 ) {
     let Some(action) = get_action_from_entity(click.entity, &query, &parents) else {
         return;
@@ -685,16 +961,39 @@ fn handle_ui_click(
             state.bounds_max = sc.bounds_max;
             state.visual_scale = sc.visual_scale;
             state.baked_result = None;
+            state.baked_image_handle = None;
             state.use_baked_raster = false;
+            state.gpu_ready_frames = 0;
 
             for e in &scene_model_query {
                 commands.entity(e).despawn();
             }
-            spawn_scene_model(&mut commands, &assets, sc.asset_path, sc.visual_scale);
+            spawn_scene_model(&mut commands, &assets, sc.asset_path, sc.visual_scale, state.use_baked_raster);
+            state.pt_pending = false;
+            state.pt_accum_frames = 0;
+            state.last_cam_eye = Vec3::ZERO;
+
+            // Update persistent BakedIrradianceVolume transform
+            if let Ok((vol_entity, existing_vol)) = volume_query.single() {
+                let center = (sc.bounds_min + sc.bounds_max) * 0.5 * sc.visual_scale;
+                let size = (sc.bounds_max - sc.bounds_min) * sc.visual_scale;
+                commands.entity(vol_entity).insert((
+                    Transform::from_translation(center).with_scale(size * 1.15),
+                    LightProbe {
+                        falloff: Vec3::splat(0.05),
+                        ..default()
+                    },
+                ));
+                if existing_vol.is_some() {
+                    commands.entity(vol_entity).remove::<IrradianceVolume>();
+                }
+            }
 
             if let Ok((mut transform, mut cam)) = cam_query.single_mut() {
                 cam.center = sc.cam_center;
-                cam.distance = sc.cam_dist;
+                cam.distance = 14.5;
+                cam.yaw = 0.85; // 3/4 perspective showing direct sunlight beam and shadows
+                cam.pitch = 0.30;
                 let eye = cam.center
                     + Vec3::new(
                         cam.yaw.cos() * cam.pitch.cos(),
@@ -703,6 +1002,12 @@ fn handle_ui_click(
                     ) * cam.distance;
                 transform.translation = eye;
                 transform.look_at(cam.center, Vec3::Y);
+            }
+
+            // Reset DirectionalLight back to scene sunlight
+            if let Ok(mut light_transform) = dir_light_query.single_mut() {
+                light_transform.translation = Vec3::new(20.0, 50.0, 30.0);
+                light_transform.look_at(sc.cam_center, Vec3::Y);
             }
 
             state.status_text = format!("Loaded: {}", sc.display_name);
@@ -727,8 +1032,10 @@ fn handle_ui_click(
             );
         }
         UiAction::ToggleBakedRaster => {
-            if state.baked_result.is_none() {
-                state.status_text = "Please bake irradiance first before enabling baked GI!".into();
+            if state.baked_result.is_none() || state.baked_image_handle.is_none() {
+                state.status_text = "Please click 'START GPU BAKE' to run the Path Tracer first!".into();
+            } else if state.gpu_ready_frames < 2 {
+                state.status_text = "Preparing GPU 3D Texture... please wait a moment".into();
             } else {
                 state.use_baked_raster = !state.use_baked_raster;
                 if state.use_baked_raster {
@@ -736,24 +1043,19 @@ fn handle_ui_click(
                     state.status_text =
                         "Mode: Raster + Baked Irradiance Volume (Path Tracing OFF)".into();
                 } else {
+                    state.pt_pending = false;
+                    state.pt_accum_frames = 0;
                     state.status_text =
-                        "Mode: Standard Direct Lighting (Path Tracing Ready)".into();
+                        "Mode: Path Tracing Preview (Real-time GPU Path Tracer)".into();
                 }
             }
         }
         UiAction::StartBake => {
             if !state.is_baking {
                 state.is_baking = true;
-                state.status_text = "Baking Irradiance on Adreno GPU (DX12)...".into();
+                state.status_text = "Path Tracing Irradiance on Adreno GPU (DX12)...".into();
 
-                let full_scene_path = if Path::new(&state.scene_path).is_absolute() {
-                    PathBuf::from(&state.scene_path)
-                } else {
-                    std::env::current_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join("assets")
-                        .join(&state.scene_path)
-                };
+                let full_scene_path = resolve_scene_path(&state.scene_path);
 
                 let task = BakeTask {
                     scene_path: full_scene_path,
@@ -770,21 +1072,61 @@ fn handle_ui_click(
         }
         UiAction::ExportOutput => {
             if let Some(ref res) = state.baked_result {
-                let out_ktx2 = PathBuf::from("baked_irradiance.vxgi.ktx2");
-                let out_meta = PathBuf::from("baked_irradiance.vxgi.meta.json");
+                let stem = {
+                    let p = Path::new(&state.scene_path);
+                    let file_stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    if file_stem.is_empty()
+                        || file_stem.eq_ignore_ascii_case("scene")
+                        || file_stem.eq_ignore_ascii_case("model")
+                    {
+                        if let Some(parent_name) = p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()) {
+                            if !parent_name.is_empty() && !parent_name.eq_ignore_ascii_case("imported") {
+                                parent_name.to_string()
+                            } else if !file_stem.is_empty() {
+                                file_stem.to_string()
+                            } else {
+                                state.scene_name.replace(' ', "_")
+                            }
+                        } else if !file_stem.is_empty() {
+                            file_stem.to_string()
+                        } else {
+                            state.scene_name.replace(' ', "_")
+                        }
+                    } else {
+                        file_stem.to_string()
+                    }
+                };
+
+                let base_name = format!("{stem}_Irradiance_Info");
+                let out_ktx2_name = format!("{base_name}.ktx2");
+                let out_meta_name = format!("{base_name}.meta.json");
+
+                let out_ktx2 = PathBuf::from(&out_ktx2_name);
+                let out_meta = PathBuf::from(&out_meta_name);
                 if let Ok(_) = std::fs::write(&out_ktx2, &res.ktx2_bytes) {
                     let meta = serde_json::json!({
-                        "voxels_texture": "baked_irradiance.vxgi.ktx2",
+                        "voxels_texture": out_ktx2_name,
                         "format": "VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 (Rgb9e5Ufloat)",
                         "resolution": [res.resolution.x, res.resolution.y, res.resolution.z],
                         "dimensions": [res.texture_dimensions.x, res.texture_dimensions.y, res.texture_dimensions.z],
+                        "bounds_min": [state.bounds_min.x, state.bounds_min.y, state.bounds_min.z],
+                        "bounds_max": [state.bounds_max.x, state.bounds_max.y, state.bounds_max.z],
+                        "scene": state.scene_name,
                     });
                     let _ = std::fs::write(
                         &out_meta,
                         serde_json::to_string_pretty(&meta).unwrap_or_default(),
                     );
+                    // Also write a copy to the assets folder so Bevy or external engines can find it immediately
+                    let assets_dir = PathBuf::from(find_assets_dir());
+                    let _ = std::fs::write(assets_dir.join(&out_ktx2_name), &res.ktx2_bytes);
+                    let _ = std::fs::write(
+                        assets_dir.join(&out_meta_name),
+                        serde_json::to_string_pretty(&meta).unwrap_or_default(),
+                    );
+
                     state.status_text =
-                        format!("Saved {} ({} bytes)!", out_ktx2.display(), res.ktx2_bytes.len());
+                        format!("Saved {} & {} ({} bytes)!", out_ktx2_name, out_meta_name, res.ktx2_bytes.len());
                 }
             } else {
                 state.status_text = "Please bake irradiance first!".into();
@@ -799,7 +1141,9 @@ fn poll_import_dialog(
     import_channel: Res<ImportChannel>,
     mut state: ResMut<AppState>,
     scene_model_query: Query<Entity, With<SceneModelRoot>>,
-    mut cam_query: Query<(&mut Transform, &mut OrbitCamera)>,
+    mut cam_query: Query<(&mut Transform, &mut OrbitCamera), (Without<SceneModelRoot>, Without<MainSunLight>)>,
+    volume_query: Query<(Entity, Option<&IrradianceVolume>), With<BakedIrradianceVolume>>,
+    mut dir_light_query: Query<&mut Transform, (With<MainSunLight>, Without<OrbitCamera>, Without<SceneModelRoot>)>,
 ) {
     let maybe_path = {
         if let Ok(rx) = import_channel.rx.lock() {
@@ -815,16 +1159,32 @@ fn poll_import_dialog(
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| "ImportedModel.glb".to_string());
 
-        // Copy file to local assets/imported directory
-        let imported_dir = Path::new("assets/imported");
-        let _ = std::fs::create_dir_all(imported_dir);
-        let dest = imported_dir.join(&file_name);
-        let _ = std::fs::copy(&path, &dest);
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "model".to_string());
 
-        // Also copy to target/debug/assets/imported if running from target/debug
-        let target_imported = Path::new("target/debug/assets/imported");
-        let _ = std::fs::create_dir_all(target_imported);
-        let _ = std::fs::copy(&path, target_imported.join(&file_name));
+        let model_folder = if stem.eq_ignore_ascii_case("scene") || stem.eq_ignore_ascii_case("model") {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or(stem)
+        } else {
+            stem
+        };
+
+        // Determine destination folder in assets based on find_assets_dir()
+        let assets_dir = PathBuf::from(find_assets_dir());
+        let dest_folder = assets_dir.join("imported").join(&model_folder);
+        let _ = copy_model_assets(&path, &dest_folder);
+
+        // Also copy into target/debug/assets/imported and assets/imported to support any launch working directory
+        let fallback_dest1 = Path::new("assets/imported").join(&model_folder);
+        let _ = copy_model_assets(&path, &fallback_dest1);
+        let fallback_dest2 = Path::new("mutbaker-gui/assets/imported").join(&model_folder);
+        let _ = copy_model_assets(&path, &fallback_dest2);
+        let fallback_dest3 = Path::new("C:/tracer-experiment/mutbaker-gui/assets/imported").join(&model_folder);
+        let _ = copy_model_assets(&path, &fallback_dest3);
 
         // Parse with NativeScene to obtain bounds & triangle count
         if let Ok(native_scene) = NativeScene::load_gltf(&path) {
@@ -838,15 +1198,16 @@ fn poll_import_dialog(
 
             let extents = b_max - b_min;
             let max_dim = extents.x.max(extents.y).max(extents.z);
-            let visual_scale = if max_dim > 100.0 {
-                0.015
+            let visual_scale = if max_dim > 2000.0 {
+                0.001 // Convert millimeters to meters
             } else {
                 1.0
             };
 
             let v_center = (b_min + b_max) * 0.5 * visual_scale;
             let v_size = extents * visual_scale;
-            let cam_dist = (v_size.x.max(v_size.y).max(v_size.z) * 2.2).clamp(3.0, 50.0);
+            let safe_v_size = v_size.max(Vec3::splat(0.2));
+            let cam_dist = (v_size.x.max(v_size.y).max(v_size.z) * 2.2).clamp(3.0, 5000.0);
 
             state.bounds_min = b_min;
             state.bounds_max = b_max;
@@ -855,18 +1216,40 @@ fn poll_import_dialog(
             state.scene_path = path.to_string_lossy().to_string();
             state.triangle_count = native_scene.triangles.len();
             state.baked_result = None;
+            state.baked_image_handle = None;
             state.use_baked_raster = false;
+            state.gpu_ready_frames = 0;
 
             for e in &scene_model_query {
                 commands.entity(e).despawn();
             }
 
-            let asset_rel_path = format!("imported/{}", file_name);
-            spawn_scene_model(&mut commands, &assets, &asset_rel_path, visual_scale);
+            let asset_rel_path = format!("imported/{}/{}", model_folder, file_name);
+            spawn_scene_model(&mut commands, &assets, &asset_rel_path, visual_scale, state.use_baked_raster);
+            state.pt_pending = false;
+            state.pt_accum_frames = 0;
+            state.last_cam_eye = Vec3::ZERO;
 
+            // Update persistent BakedIrradianceVolume transform
+            if let Ok((vol_entity, existing_vol)) = volume_query.single() {
+                commands.entity(vol_entity).insert((
+                    Transform::from_translation(v_center).with_scale(safe_v_size * 1.15),
+                    LightProbe {
+                        falloff: Vec3::splat(0.05),
+                        ..default()
+                    },
+                ));
+                if existing_vol.is_some() {
+                    commands.entity(vol_entity).remove::<IrradianceVolume>();
+                }
+            }
+
+            // Aim camera at imported model center
             if let Ok((mut transform, mut cam)) = cam_query.single_mut() {
                 cam.center = v_center;
                 cam.distance = cam_dist;
+                cam.yaw = 0.85;
+                cam.pitch = 0.30;
                 let eye = cam.center
                     + Vec3::new(
                         cam.yaw.cos() * cam.pitch.cos(),
@@ -875,6 +1258,14 @@ fn poll_import_dialog(
                     ) * cam.distance;
                 transform.translation = eye;
                 transform.look_at(cam.center, Vec3::Y);
+            }
+
+            // Adjust directional light to illuminate imported scene from above
+            if let Ok(mut light_transform) = dir_light_query.single_mut() {
+                let light_dir = Vec3::new(1.0, 1.8, 1.2).normalize();
+                let light_dist = v_size.length() * 1.5;
+                light_transform.translation = v_center + light_dir * light_dist;
+                light_transform.look_at(v_center, Vec3::Y);
             }
 
             state.status_text = format!(
@@ -1021,6 +1412,120 @@ fn orbit_camera_controller(
     transform.look_at(cam.center, Vec3::Y);
 }
 
+fn dispatch_viewport_pt_system(
+    mut state: ResMut<AppState>,
+    cam_query: Query<(&Transform, &OrbitCamera)>,
+) {
+    if state.use_baked_raster {
+        return;
+    }
+
+    if state.pt_pending {
+        return;
+    }
+
+    let Ok((cam_trans, cam)) = cam_query.single() else {
+        return;
+    };
+
+    let visual_scale = if state.visual_scale.abs() > 1e-6 {
+        state.visual_scale
+    } else {
+        1.0
+    };
+    let eye = cam_trans.translation / visual_scale;
+    let center = cam.center / visual_scale;
+    let forward = (center - eye).normalize();
+    let right = forward.cross(Vec3::Y).normalize();
+    let up = right.cross(forward).normalize();
+
+    let cam_moved = eye.distance_squared(state.last_cam_eye) > 0.0001
+        || center.distance_squared(state.last_cam_center) > 0.0001;
+
+    if cam_moved {
+        state.last_cam_eye = eye;
+        state.last_cam_center = center;
+        state.pt_accum_frames = 0;
+    } else {
+        state.pt_accum_frames += 1;
+        if state.pt_accum_frames > 8 {
+            return;
+        }
+    }
+
+    let full_scene_path = resolve_scene_path(&state.scene_path);
+
+    let spp = if cam_moved { 1 } else { 4 };
+    let task = ViewportPtTask {
+        scene_path: full_scene_path,
+        eye,
+        forward,
+        right,
+        up,
+        width: 480,
+        height: 380,
+        spp,
+        max_bounces: state.bounces.min(3),
+        seed: state.pt_accum_frames * 997,
+    };
+
+    if state.pt_task_tx.send(task).is_ok() {
+        state.pt_pending = true;
+    }
+}
+
+fn poll_viewport_pt_results(
+    mut state: ResMut<AppState>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let maybe_res = {
+        if let Ok(rx) = state.pt_res_rx.lock() {
+            rx.try_recv().ok()
+        } else {
+            None
+        }
+    };
+
+    if let Some(res) = maybe_res {
+        state.pt_pending = false;
+        if let Some(ref handle) = state.pt_image_handle {
+            if let Some(mut image) = images.get_mut(handle) {
+                image.data = Some(res.pixels);
+            }
+        }
+    }
+}
+
+fn sync_viewport_mode_visibilities(
+    state: Res<AppState>,
+    mut overlay_query: Query<&mut Visibility, (With<PathTraceViewportOverlay>, Without<SceneModelRoot>)>,
+    mut scene_model_query: Query<&mut Visibility, (With<SceneModelRoot>, Without<PathTraceViewportOverlay>)>,
+) {
+    let pt_visible = if !state.use_baked_raster {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+
+    let raster_visible = if state.use_baked_raster {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+
+    for mut vis in &mut overlay_query {
+        if *vis != pt_visible {
+            *vis = pt_visible;
+        }
+    }
+
+    for mut vis in &mut scene_model_query {
+        if *vis != raster_visible {
+            *vis = raster_visible;
+        }
+    }
+}
+
 fn sync_probe_spheres(
     mut commands: Commands,
     state: Res<AppState>,
@@ -1114,6 +1619,7 @@ fn sync_probe_spheres(
                     MeshMaterial3d(mat_handle),
                     Transform::from_translation(vp).with_scale(Vec3::splat(radius)),
                     ProbeSphere,
+                    NotShadowCaster,
                 ));
             }
         }
@@ -1192,70 +1698,72 @@ fn draw_probe_gizmos(mut gizmos: Gizmos, state: Res<AppState>) {
     }
 }
 
+#[inline]
+fn f32_to_f16(f: f32) -> u16 {
+    let x = f.to_bits();
+    let sign = (x >> 16) & 0x8000;
+    let exp = ((x >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = x & 0x7f_ffff;
+
+    if exp <= 0 {
+        if exp < -10 {
+            return sign as u16;
+        }
+        let mant = (mant | 0x80_0000) >> (1 - exp);
+        return (sign | (mant >> 13)) as u16;
+    } else if exp >= 31 {
+        return (sign | 0x7c00) as u16;
+    }
+    (sign | ((exp as u32) << 10) | (mant >> 13)) as u16
+}
+
 fn sync_baked_irradiance_volume(
     mut commands: Commands,
     state: Res<AppState>,
-    mut images: ResMut<Assets<Image>>,
+    images: Res<Assets<Image>>,
     mut ambient_light: ResMut<GlobalAmbientLight>,
-    volume_query: Query<Entity, With<BakedIrradianceVolume>>,
+    volume_query: Query<(Entity, Option<&IrradianceVolume>), With<BakedIrradianceVolume>>,
 ) {
-    if !state.is_changed() {
+    let Ok((entity, existing_irradiance)) = volume_query.single() else {
         return;
-    }
+    };
 
-    if state.use_baked_raster && state.baked_result.is_some() {
-        let res = state.baked_result.as_ref().unwrap();
-
-        if volume_query.is_empty() {
-            let mut packed_pixels: Vec<u32> = Vec::with_capacity(res.raw_floats.len());
-            for p in &res.raw_floats {
-                packed_pixels.push(muttracer_native::ktx2_writer::pack_rgb9e5(p[0], p[1], p[2]));
+    if state.use_baked_raster {
+        if let Some(ref handle) = state.baked_image_handle {
+            if images.get(handle).is_some() && state.gpu_ready_frames >= 2 {
+                let need_update = match existing_irradiance {
+                    Some(vol) => vol.voxels != *handle,
+                    None => true,
+                };
+                if need_update {
+                    commands.entity(entity).insert((
+                        IrradianceVolume {
+                            voxels: handle.clone(),
+                            intensity: 2800.0,
+                            ..default()
+                        },
+                        LightProbe {
+                            falloff: Vec3::splat(0.05),
+                            ..default()
+                        },
+                    ));
+                }
+                ambient_light.brightness = 30.0;
+                return;
             }
-
-            let image = Image::new(
-                Extent3d {
-                    width: res.texture_dimensions.x,
-                    height: res.texture_dimensions.y,
-                    depth_or_array_layers: res.texture_dimensions.z,
-                },
-                TextureDimension::D3,
-                bytemuck::cast_slice(&packed_pixels).to_vec(),
-                TextureFormat::Rgb9e5Ufloat,
-                RenderAssetUsages::RENDER_WORLD,
-            );
-            let image_handle = images.add(image);
-
-            let center = (state.bounds_min + state.bounds_max) * 0.5 * state.visual_scale;
-            let size = (state.bounds_max - state.bounds_min) * state.visual_scale;
-
-            // Expand volume bounds by 25% with gentle falloff so all walls, ceiling and floor are inside the light probe range
-            let volume_size = size * 1.25;
-
-            commands.spawn((
-                Transform::from_translation(center).with_scale(volume_size),
-                LightProbe {
-                    falloff: Vec3::splat(0.06),
-                },
-                IrradianceVolume {
-                    voxels: image_handle,
-                    intensity: 1400.0,
-                    ..default()
-                },
-                BakedIrradianceVolume,
-            ));
         }
-
-        // Soft ambient fill alongside the rich baked indirect global illumination
-        ambient_light.brightness = 150.0;
-    } else {
-        for entity in &volume_query {
-            commands.entity(entity).despawn();
-        }
-        ambient_light.brightness = 800.0;
     }
+
+    if existing_irradiance.is_some() {
+        commands.entity(entity).remove::<IrradianceVolume>();
+    }
+    ambient_light.brightness = 350.0;
 }
 
-fn poll_bake_results(mut state: ResMut<AppState>) {
+fn poll_bake_results(
+    mut state: ResMut<AppState>,
+    mut images: ResMut<Assets<Image>>,
+) {
     let maybe_res = {
         if let Ok(rx) = state.bake_rx.lock() {
             rx.try_recv().ok()
@@ -1269,14 +1777,66 @@ fn poll_bake_results(mut state: ResMut<AppState>) {
         match res {
             BakeTaskResult::Success(b) => {
                 state.status_text = format!(
-                    "Baked in {:.2?} | {}x{}x{} ({} bytes)",
+                    "Baked via DX12 Path Tracer in {:.2?} | {}x{}x{} ({} bytes)",
                     b.duration,
                     b.texture_dimensions.x,
                     b.texture_dimensions.y,
                     b.texture_dimensions.z,
                     b.ktx2_bytes.len()
                 );
+
+                // Try native KTX2 decode first (matches Bevy IrradianceVolume specification)
+                let ktx2_image = Image::from_buffer(
+                    &b.ktx2_bytes,
+                    bevy::image::ImageType::Extension("ktx2".into()),
+                    bevy::image::CompressedImageFormats::all(),
+                    false,
+                    bevy::image::ImageSampler::linear(),
+                    RenderAssetUsages::all(),
+                );
+
+                let handle = match ktx2_image {
+                    Ok(mut img) => {
+                        img.asset_usage = RenderAssetUsages::all();
+                        img.texture_view_descriptor = Some(TextureViewDescriptor {
+                            dimension: Some(TextureViewDimension::D3),
+                            ..default()
+                        });
+                        images.add(img)
+                    }
+                    Err(e) => {
+                        eprintln!("[baker] KTX2 decode fallback: {e}");
+                        let mut f16_pixels: Vec<u16> = Vec::with_capacity(b.raw_floats.len() * 4);
+                        for p in &b.raw_floats {
+                            f16_pixels.push(f32_to_f16(p[0]));
+                            f16_pixels.push(f32_to_f16(p[1]));
+                            f16_pixels.push(f32_to_f16(p[2]));
+                            f16_pixels.push(f32_to_f16(1.0));
+                        }
+
+                        let mut image = Image::new(
+                            Extent3d {
+                                width: b.texture_dimensions.x,
+                                height: b.texture_dimensions.y,
+                                depth_or_array_layers: b.texture_dimensions.z,
+                            },
+                            TextureDimension::D3,
+                            bytemuck::cast_slice(&f16_pixels).to_vec(),
+                            TextureFormat::Rgba16Float,
+                            RenderAssetUsages::all(),
+                        );
+                        image.sampler = bevy::image::ImageSampler::linear();
+                        image.texture_view_descriptor = Some(TextureViewDescriptor {
+                            dimension: Some(TextureViewDimension::D3),
+                            ..default()
+                        });
+                        images.add(image)
+                    }
+                };
+
+                state.baked_image_handle = Some(handle);
                 state.baked_result = Some(b);
+                state.gpu_ready_frames = 0;
             }
             BakeTaskResult::Error(err) => {
                 state.status_text = format!("Bake Error: {}", err);
@@ -1295,17 +1855,23 @@ fn update_labels(
     }
     for mut text in &mut info_query {
         let total_p = state.resolution.x * state.resolution.y * state.resolution.z;
-        let mode_desc = if state.is_baking {
-            "GPU Path Tracing Active"
-        } else if state.use_baked_raster {
+        let viewport_desc = if state.use_baked_raster {
             "Raster + Baked GI"
         } else {
-            "Direct Raster Preview"
+            "Path Tracing Preview"
+        };
+        let baker_desc = if state.is_baking {
+            "MuTracer DX12 Path Tracer (Baking...)"
+        } else if state.baked_result.is_some() {
+            "MuTracer DX12 Path Tracer (Bake Ready)"
+        } else {
+            "MuTracer DX12 Path Tracer (Active)"
         };
         text.0 = format!(
-            "Model: {}\nPipeline: {}\nGrid: {}x{}x{} ({} Probes)\nSPP: {} | Bounces: {}",
+            "Model: {}\nViewport: {}\nBaker: {}\nGrid: {}x{}x{} ({} Probes)\nSPP: {} | Bounces: {}",
             state.scene_name,
-            mode_desc,
+            viewport_desc,
+            baker_desc,
             state.resolution.x,
             state.resolution.y,
             state.resolution.z,

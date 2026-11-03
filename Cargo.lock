@@ -791,6 +791,7 @@ dependencies = [
  "guillotiere",
  "half",
  "image",
+ "ktx2",
  "rectangle-pack",
  "serde",
  "thiserror 2.0.19",
@@ -2955,6 +2956,7 @@ dependencies = [
  "glam",
  "ktx2",
  "muttracer-native",
+ "naga",
  "serde",
  "serde_json",
 ]
