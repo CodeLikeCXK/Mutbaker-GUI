@@ -70,15 +70,16 @@ impl GpuContext {
 
         let limits = adapter.limits();
         eprintln!(
-            "[gpu] Limits: max_buffer_size = {} MB, max_storage_buffer_binding_size = {} MB",
+            "[gpu] Limits: max_buffer_size = {} MB, max_storage_buffer_binding_size = {} MB, max_storage_buffers = {}",
             limits.max_buffer_size / (1024 * 1024),
-            limits.max_storage_buffer_binding_size / (1024 * 1024)
+            limits.max_storage_buffer_binding_size / (1024 * 1024),
+            limits.max_storage_buffers_per_shader_stage
         );
 
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("muttracer-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits: limits.clone(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: Default::default(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),

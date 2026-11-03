@@ -681,8 +681,11 @@ pub struct ViewportPtUniforms {
     pub forward: [f32; 4],
     pub right: [f32; 4],
     pub up: [f32; 4],
+    pub bounds_min: [f32; 4],
+    pub bounds_max: [f32; 4],
     pub dims: [u32; 4],   // width, height, spp, max_bounces
-    pub params: [u32; 4], // rng_seed, pad, pad, pad
+    pub params: [u32; 4], // rng_seed, mode (0=PT, 1=Raster+BakedGI), has_irradiance, pad
+    pub grid_res: [u32; 4], // rx, ry, rz, pad
 }
 
 #[derive(Clone, Debug)]
@@ -696,6 +699,11 @@ pub struct ViewportPtSettings {
     pub spp: u32,
     pub max_bounces: u32,
     pub seed: u32,
+    pub mode: u32,
+    pub bounds_min: Vec3,
+    pub bounds_max: Vec3,
+    pub resolution: UVec3,
+    pub irradiance_voxels: Option<Vec<[f32; 4]>>,
 }
 
 const VIEWPORT_SHADER_SRC: &str = r#"
@@ -704,8 +712,11 @@ struct ViewportPtUniforms {
     forward: vec4f,
     right: vec4f,
     up: vec4f,
-    dims: vec4u,   // width, height, spp, max_bounces
-    params: vec4u, // rng_seed, pad, pad, pad
+    bounds_min: vec4f,
+    bounds_max: vec4f,
+    dims: vec4u,     // width, height, spp, max_bounces
+    params: vec4u,   // rng_seed, mode, has_irradiance, pad
+    grid_res: vec4u, // rx, ry, rz, pad
 };
 
 struct GpuBvhNode {
@@ -748,6 +759,86 @@ struct GpuMaterial {
 @group(0) @binding(4) var<storage, read_write> out_pixels: array<u32>;
 @group(0) @binding(5) var tex_array: texture_2d_array<f32>;
 @group(0) @binding(6) var tex_sampler: sampler;
+@group(0) @binding(7) var<storage, read> irradiance_voxels: array<vec4f>;
+
+fn sample_face_trilinear(face: u32, stp: vec3f) -> vec3f {
+    let rx = u.grid_res.x;
+    let ry = u.grid_res.y;
+    let rz = u.grid_res.z;
+    if (rx == 0u || ry == 0u || rz == 0u) {
+        return vec3f(0.0);
+    }
+    let tex_w = rx;
+    let tex_h = 2u * ry;
+
+    let fx = clamp(stp.x, 0.0, f32(rx - 1u));
+    let fy = clamp(stp.y, 0.0, f32(ry - 1u));
+    let fz = clamp(stp.z, 0.0, f32(rz - 1u));
+
+    let x0 = u32(floor(fx));
+    let x1 = min(x0 + 1u, rx - 1u);
+    let wx = fx - f32(x0);
+
+    let y0 = u32(floor(fy));
+    let y1 = min(y0 + 1u, ry - 1u);
+    let wy = fy - f32(y0);
+
+    let z0 = u32(floor(fz));
+    let z1 = min(z0 + 1u, rz - 1u);
+    let wz = fz - f32(z0);
+
+    var t_off = 0u;
+    if ((face & 1u) == 1u) {
+        t_off = ry;
+    }
+    let p_off = (face / 2u) * rz;
+
+    let slice_stride = tex_w * tex_h;
+
+    let c000 = irradiance_voxels[x0 + (y0 + t_off) * tex_w + (z0 + p_off) * slice_stride].rgb;
+    let c100 = irradiance_voxels[x1 + (y0 + t_off) * tex_w + (z0 + p_off) * slice_stride].rgb;
+    let c010 = irradiance_voxels[x0 + (y1 + t_off) * tex_w + (z0 + p_off) * slice_stride].rgb;
+    let c110 = irradiance_voxels[x1 + (y1 + t_off) * tex_w + (z0 + p_off) * slice_stride].rgb;
+    let c001 = irradiance_voxels[x0 + (y0 + t_off) * tex_w + (z1 + p_off) * slice_stride].rgb;
+    let c101 = irradiance_voxels[x1 + (y0 + t_off) * tex_w + (z1 + p_off) * slice_stride].rgb;
+    let c011 = irradiance_voxels[x0 + (y1 + t_off) * tex_w + (z1 + p_off) * slice_stride].rgb;
+    let c111 = irradiance_voxels[x1 + (y1 + t_off) * tex_w + (z1 + p_off) * slice_stride].rgb;
+
+    let c00 = mix(c000, c100, wx);
+    let c10 = mix(c010, c110, wx);
+    let c01 = mix(c001, c101, wx);
+    let c11 = mix(c011, c111, wx);
+
+    let c0 = mix(c00, c10, wy);
+    let c1 = mix(c01, c11, wy);
+
+    return mix(c0, c1, wz);
+}
+
+fn sample_irradiance_volume(p: vec3f, n: vec3f) -> vec3f {
+    let bmin = u.bounds_min.xyz;
+    let bmax = u.bounds_max.xyz;
+    let bsize = max(bmax - bmin, vec3f(1e-4));
+    let rel_p = clamp((p - bmin) / bsize, vec3f(0.0), vec3f(1.0));
+
+    let rx = f32(u.grid_res.x);
+    let ry = f32(u.grid_res.y);
+    let rz = f32(u.grid_res.z);
+    let res = vec3f(rx, ry, rz);
+
+    let stp = clamp(rel_p * res, vec3f(0.5), res - vec3f(0.5)) - vec3f(0.5);
+
+    let face_x = select(1u, 0u, n.x >= 0.0);
+    let face_y = select(3u, 2u, n.y >= 0.0);
+    let face_z = select(5u, 4u, n.z >= 0.0);
+
+    let col_x = sample_face_trilinear(face_x, stp);
+    let col_y = sample_face_trilinear(face_y, stp);
+    let col_z = sample_face_trilinear(face_z, stp);
+
+    let NN = n * n;
+    return col_x * NN.x + col_y * NN.y + col_z * NN.z;
+}
 
 struct HitRecord {
     t: f32,
@@ -850,12 +941,82 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let height = u.dims.y;
     if (px >= width || py >= height) { return; }
 
-    let spp = max(1u, u.dims.z);
-    let max_bounces = u.dims.w;
-    var seed = px + py * width + u.params.x * 1973u;
+    let mode = u.params.y; // 0 = Pathtracer Preview, 1 = Raster + Baked GI
+    let has_irr = u.params.z;
 
     let tan_half_fov = 0.41421356f;
     let aspect = f32(width) / f32(height);
+
+    if (mode == 1u) {
+        // Mode 1: Raster + Baked GI (Fast deterministic, single primary ray + direct sun + baked irradiance volume)
+        let ndc_x = ((f32(px) + 0.5) / f32(width)) * 2.0 - 1.0;
+        let ndc_y = 1.0 - ((f32(py) + 0.5) / f32(height)) * 2.0;
+
+        let ray_dir = normalize(u.forward.xyz + u.right.xyz * (ndc_x * aspect * tan_half_fov) + u.up.xyz * (ndc_y * tan_half_fov));
+        let ray_o = u.eye.xyz;
+
+        let hit = trace_ray(ray_o, ray_dir, 1e5);
+        var col_linear = vec3f(0.0);
+
+        if (hit.tri_idx == 0xFFFFFFFFu) {
+            let bg_grad = clamp(ray_dir.y * 0.5 + 0.5, 0.0, 1.0);
+            col_linear = mix(vec3f(0.067, 0.071, 0.078), vec3f(0.09, 0.10, 0.12), bg_grad);
+        } else {
+            let tri = triangles[hit.tri_idx];
+            let mat = materials[tri.material_idx];
+
+            let w = 1.0 - hit.u - hit.v;
+            let uv = fract(w * tri.uv0 + hit.u * tri.uv1 + hit.v * tri.uv2);
+
+            var albedo = mat.base_color.rgb;
+            if (mat.tex_index.x >= 0) {
+                let s = textureSampleLevel(tex_array, tex_sampler, uv, mat.tex_index.x, 0.0);
+                albedo *= s.rgb;
+            }
+
+            var hit_n = normalize(w * tri.n0 + hit.u * tri.n1 + hit.v * tri.n2);
+            if (dot(hit_n, ray_dir) > 0.0) {
+                hit_n = -hit_n;
+            }
+
+            let eps = max(0.003, hit.t * 0.0005);
+            let hit_p = ray_o + ray_dir * hit.t + hit_n * eps;
+
+            // Direct Sunlight
+            let sun_dir = normalize(vec3f(0.32, 0.81, 0.49));
+            let n_dot_sun = max(0.0, dot(hit_n, sun_dir));
+            var sun_radiance = vec3f(0.0);
+            if (n_dot_sun > 0.0) {
+                let shadow_hit = trace_ray(hit_p, sun_dir, 1e5);
+                if (shadow_hit.tri_idx == 0xFFFFFFFFu) {
+                    sun_radiance = vec3f(1.0, 0.98, 0.92) * (1.35 * n_dot_sun);
+                }
+            }
+
+            // Indirect Baked GI
+            var indirect_gi = vec3f(0.08, 0.09, 0.11) * (hit_n.y * 0.3 + 0.7);
+            if (has_irr == 1u) {
+                indirect_gi = sample_irradiance_volume(hit_p, hit_n);
+            }
+
+            let emissive = min(mat.emissive.rgb, vec3f(15.0));
+            col_linear = emissive + albedo * (sun_radiance + indirect_gi);
+        }
+
+        var col = col_linear / (col_linear + vec3f(1.0));
+        col = pow(col, vec3f(1.0 / 2.2));
+
+        let r = u32(clamp(col.r * 255.0, 0.0, 255.0));
+        let g = u32(clamp(col.g * 255.0, 0.0, 255.0));
+        let b = u32(clamp(col.b * 255.0, 0.0, 255.0));
+        let pixel_idx = py * width + px;
+        out_pixels[pixel_idx] = r | (g << 8u) | (b << 16u) | (255u << 24u);
+        return;
+    }
+
+    let spp = max(1u, u.dims.z);
+    let max_bounces = u.dims.w;
+    var seed = px + py * width + u.params.x * 1973u;
 
     var accum_col = vec3f(0.0);
 
@@ -966,13 +1127,17 @@ pub fn render_viewport_pt(
     let total_pixels = (width * height) as usize;
     let output_byte_len = (total_pixels * 4) as u64;
 
+    let has_irr = if settings.irradiance_voxels.as_ref().map_or(false, |v| !v.is_empty()) { 1 } else { 0 };
     let uniforms = ViewportPtUniforms {
         eye: [settings.eye.x, settings.eye.y, settings.eye.z, 0.0],
         forward: [settings.forward.x, settings.forward.y, settings.forward.z, 0.0],
         right: [settings.right.x, settings.right.y, settings.right.z, 0.0],
         up: [settings.up.x, settings.up.y, settings.up.z, 0.0],
+        bounds_min: [settings.bounds_min.x, settings.bounds_min.y, settings.bounds_min.z, 0.0],
+        bounds_max: [settings.bounds_max.x, settings.bounds_max.y, settings.bounds_max.z, 0.0],
         dims: [width, height, settings.spp, settings.max_bounces],
-        params: [settings.seed, 0, 0, 0],
+        params: [settings.seed, settings.mode, has_irr, 0],
+        grid_res: [settings.resolution.x, settings.resolution.y, settings.resolution.z, 0],
     };
 
     let uniform_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1066,6 +1231,24 @@ pub fn render_viewport_pt(
         ..Default::default()
     });
 
+    let irradiance_slice: &[[f32; 4]] = if let Some(ref data) = settings.irradiance_voxels {
+        if !data.is_empty() {
+            data.as_slice()
+        } else {
+            &[[0.0, 0.0, 0.0, 0.0]]
+        }
+    } else {
+        &[[0.0, 0.0, 0.0, 0.0]]
+    };
+    let irradiance_bytes = bytemuck::cast_slice(irradiance_slice);
+    let irradiance_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vp-irradiance"),
+        size: irradiance_bytes.len() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    gpu.queue.write_buffer(&irradiance_buf, 0, irradiance_bytes);
+
     let shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("vp-pt-shader"),
         source: wgpu::ShaderSource::Wgsl(VIEWPORT_SHADER_SRC.into()),
@@ -1140,6 +1323,16 @@ pub fn render_viewport_pt(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -1154,6 +1347,7 @@ pub fn render_viewport_pt(
             wgpu::BindGroupEntry { binding: 4, resource: output_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&tex_view) },
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&tex_sampler) },
+            wgpu::BindGroupEntry { binding: 7, resource: irradiance_buf.as_entire_binding() },
         ],
     });
 
@@ -1207,6 +1401,92 @@ pub fn render_viewport_pt(
     readback_buf.unmap();
 
     Ok(pixels)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_viewport_pt() {
+        let gpu = match GpuContext::new_dx12() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("DX12 init failed: {e:#}");
+                return;
+            }
+        };
+        let path = std::path::Path::new("C:/tracer-experiment/mutbaker-gui/assets/models/CornellBox/CornellBox.glb");
+        if !path.exists() {
+            eprintln!("Path not found: {:?}", path);
+            return;
+        }
+        let scene = match crate::scene::Scene::load_gltf(path) {
+            Ok(s) => s,
+            Err(e) => {
+                panic!("load gltf failed: {e:#}");
+            }
+        };
+        let bvh = FlatBvh::build(&scene);
+        let sc_cam_center = glam::Vec3::new(-4.17, 4.11, -4.19);
+        let cam_dist = 14.5f32;
+        let yaw = 0.85f32;
+        let pitch = 0.30f32;
+        let visual_scale = 0.015f32;
+
+        let cam_pos = sc_cam_center + glam::Vec3::new(
+            yaw.cos() * pitch.cos(),
+            pitch.sin(),
+            yaw.sin() * pitch.cos(),
+        ) * cam_dist;
+
+        let eye = cam_pos / visual_scale;
+        let center = sc_cam_center / visual_scale;
+        let forward = (center - eye).normalize();
+        let right = forward.cross(glam::Vec3::Y).normalize();
+        let up = right.cross(forward).normalize();
+
+        println!("Test Cam: eye={:?}, forward={:?}, right={:?}, up={:?}", eye, forward, right, up);
+
+        let settings = ViewportPtSettings {
+            eye,
+            forward,
+            right,
+            up,
+            width: 480,
+            height: 380,
+            spp: 4,
+            max_bounces: 2,
+            seed: 1234,
+            mode: 0,
+            bounds_min: glam::Vec3::new(-556.0, 0.0, -559.2),
+            bounds_max: glam::Vec3::new(0.0, 548.8, 0.0),
+            resolution: glam::UVec3::new(4, 4, 4),
+            irradiance_voxels: None,
+        };
+        let res = render_viewport_pt(&gpu, &bvh, &settings);
+        match res {
+            Ok(pixels) => {
+                println!("SUCCESS! Rendered {} pixels", pixels.len());
+                let non_zero_count = pixels.chunks(4).filter(|p| p[0] > 0 || p[1] > 0 || p[2] > 0).count();
+                println!("Non-black pixels: {} / {}", non_zero_count, pixels.len() / 4);
+                // Check sample colors
+                let mut colors: std::collections::BTreeMap<(u8, u8, u8), usize> = std::collections::BTreeMap::new();
+                for chunk in pixels.chunks(4) {
+                    *colors.entry((chunk[0], chunk[1], chunk[2])).or_insert(0) += 1;
+                }
+                println!("Top 5 unique colors:");
+                let mut sorted_colors: Vec<_> = colors.into_iter().collect();
+                sorted_colors.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+                for (col, count) in sorted_colors.iter().take(5) {
+                    println!("  Color {:?}: {} pixels", col, count);
+                }
+            }
+            Err(e) => {
+                panic!("render_viewport_pt FAILED: {:#}", e);
+            }
+        }
+    }
 }
 
 

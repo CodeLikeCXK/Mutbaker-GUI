@@ -1,0 +1,37 @@
+{
+  "bevy_transform": {
+    "scale": [
+      44.60734558105469,
+      1.0153992176055908,
+      44.77317428588867
+    ],
+    "translation": [
+      0.07571887969970703,
+      -0.46154507994651794,
+      0.15109634399414062
+    ]
+  },
+  "bevy_usage_example": "commands.spawn((\n    Transform::from_xyz(0.0757, -0.4615, 0.1511).with_scale(Vec3::new(44.6073, 1.0154, 44.7732)),\n    IrradianceVolume {\n        voxels: asset_server.load(\"Example.vxgi.ktx2\"),\n        intensity: 1.0,\n        ..default()\n    },\n));",
+  "bounds_max": [
+    22.379390716552734,
+    0.046154510229825974,
+    22.537683486938477
+  ],
+  "bounds_min": [
+    -22.22795295715332,
+    -0.969244658946991,
+    -22.235490798950195
+  ],
+  "format": "VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 (Rgb9e5Ufloat)",
+  "texture_3d_dimensions": [
+    8,
+    16,
+    9
+  ],
+  "voxel_resolution": [
+    8,
+    8,
+    3
+  ],
+  "voxels_texture": "Example.vxgi.ktx2"
+}

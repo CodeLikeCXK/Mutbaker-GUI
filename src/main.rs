@@ -1,7 +1,7 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
-use bevy::light::{IrradianceVolume, LightProbe, NotShadowCaster};
+use bevy::light::{LightProbe, NotShadowCaster};
 use bevy::picking::events::{PointerClick, PointerOut, PointerOver};
 use bevy::prelude::*;
 use bevy::render::error_handler::{RenderErrorHandler, RenderErrorPolicy};
@@ -125,6 +125,11 @@ pub struct ViewportPtTask {
     pub spp: u32,
     pub max_bounces: u32,
     pub seed: u32,
+    pub mode: u32,
+    pub bounds_min: Vec3,
+    pub bounds_max: Vec3,
+    pub resolution: UVec3,
+    pub irradiance_voxels: Option<Vec<[f32; 4]>>,
 }
 
 pub struct ViewportPtResult {
@@ -360,15 +365,36 @@ fn main() {
                     spp: latest_task.spp,
                     max_bounces: latest_task.max_bounces,
                     seed: latest_task.seed,
+                    mode: latest_task.mode,
+                    bounds_min: latest_task.bounds_min,
+                    bounds_max: latest_task.bounds_max,
+                    resolution: latest_task.resolution,
+                    irradiance_voxels: latest_task.irradiance_voxels,
                 };
 
-                if let Ok(pixels) = render_viewport_pt(&gpu, bvh, &settings) {
-                    let _ = pt_res_tx.send(ViewportPtResult {
-                        pixels,
-                        width: latest_task.width,
-                        height: latest_task.height,
-                    });
+                match render_viewport_pt(&gpu, bvh, &settings) {
+                    Ok(pixels) => {
+                        let _ = pt_res_tx.send(ViewportPtResult {
+                            pixels,
+                            width: latest_task.width,
+                            height: latest_task.height,
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[viewport-pt] render error: {e:#}");
+                        let _ = pt_res_tx.send(ViewportPtResult {
+                            pixels: Vec::new(),
+                            width: 0,
+                            height: 0,
+                        });
+                    }
                 }
+            } else {
+                let _ = pt_res_tx.send(ViewportPtResult {
+                    pixels: Vec::new(),
+                    width: 0,
+                    height: 0,
+                });
             }
         }
     });
@@ -750,7 +776,7 @@ fn build_ui(commands: &mut Commands) {
                     action_button(panel, "START GPU BAKE", UiAction::StartBake);
                     panel_button(
                         panel,
-                        "Raster + Baked GI: OFF",
+                        "Pathtracer Preview",
                         UiAction::ToggleBakedRaster,
                     );
                     action_button(panel, "EXPORT KTX2", UiAction::ExportOutput);
@@ -925,7 +951,7 @@ fn handle_ui_click(
     mut state: ResMut<AppState>,
     scene_model_query: Query<Entity, With<SceneModelRoot>>,
     mut cam_query: Query<(&mut Transform, &mut OrbitCamera), (Without<SceneModelRoot>, Without<MainSunLight>)>,
-    volume_query: Query<(Entity, Option<&IrradianceVolume>), With<BakedIrradianceVolume>>,
+    volume_query: Query<Entity, With<BakedIrradianceVolume>>,
     mut dir_light_query: Query<&mut Transform, (With<MainSunLight>, Without<OrbitCamera>, Without<SceneModelRoot>)>,
 ) {
     let Some(action) = get_action_from_entity(click.entity, &query, &parents) else {
@@ -974,7 +1000,7 @@ fn handle_ui_click(
             state.last_cam_eye = Vec3::ZERO;
 
             // Update persistent BakedIrradianceVolume transform
-            if let Ok((vol_entity, existing_vol)) = volume_query.single() {
+            if let Ok(vol_entity) = volume_query.single() {
                 let center = (sc.bounds_min + sc.bounds_max) * 0.5 * sc.visual_scale;
                 let size = (sc.bounds_max - sc.bounds_min) * sc.visual_scale;
                 commands.entity(vol_entity).insert((
@@ -984,9 +1010,6 @@ fn handle_ui_click(
                         ..default()
                     },
                 ));
-                if existing_vol.is_some() {
-                    commands.entity(vol_entity).remove::<IrradianceVolume>();
-                }
             }
 
             if let Ok((mut transform, mut cam)) = cam_query.single_mut() {
@@ -1032,22 +1055,21 @@ fn handle_ui_click(
             );
         }
         UiAction::ToggleBakedRaster => {
-            if state.baked_result.is_none() || state.baked_image_handle.is_none() {
-                state.status_text = "Please click 'START GPU BAKE' to run the Path Tracer first!".into();
-            } else if state.gpu_ready_frames < 2 {
-                state.status_text = "Preparing GPU 3D Texture... please wait a moment".into();
-            } else {
-                state.use_baked_raster = !state.use_baked_raster;
-                if state.use_baked_raster {
-                    state.is_baking = false;
-                    state.status_text =
-                        "Mode: Raster + Baked Irradiance Volume (Path Tracing OFF)".into();
+            state.use_baked_raster = !state.use_baked_raster;
+            state.pt_accum_frames = 0;
+            state.last_cam_eye = Vec3::ZERO;
+            if state.use_baked_raster {
+                state.is_baking = false;
+                state.status_text = if state.baked_result.is_some() {
+                    "Mode: Raster + Baked GI (Sample Irradiance Volume)".into()
                 } else {
-                    state.pt_pending = false;
-                    state.pt_accum_frames = 0;
-                    state.status_text =
-                        "Mode: Path Tracing Preview (Real-time GPU Path Tracer)".into();
-                }
+                    "Mode: Raster + Baked GI (Click START GPU BAKE to bake GI)".into()
+                };
+            } else {
+                state.pt_pending = false;
+                state.pt_accum_frames = 0;
+                state.status_text =
+                    "Mode: Pathtracer Preview (Real-time GPU Path Tracer)".into();
             }
         }
         UiAction::StartBake => {
@@ -1142,7 +1164,7 @@ fn poll_import_dialog(
     mut state: ResMut<AppState>,
     scene_model_query: Query<Entity, With<SceneModelRoot>>,
     mut cam_query: Query<(&mut Transform, &mut OrbitCamera), (Without<SceneModelRoot>, Without<MainSunLight>)>,
-    volume_query: Query<(Entity, Option<&IrradianceVolume>), With<BakedIrradianceVolume>>,
+    volume_query: Query<Entity, With<BakedIrradianceVolume>>,
     mut dir_light_query: Query<&mut Transform, (With<MainSunLight>, Without<OrbitCamera>, Without<SceneModelRoot>)>,
 ) {
     let maybe_path = {
@@ -1231,7 +1253,7 @@ fn poll_import_dialog(
             state.last_cam_eye = Vec3::ZERO;
 
             // Update persistent BakedIrradianceVolume transform
-            if let Ok((vol_entity, existing_vol)) = volume_query.single() {
+            if let Ok(vol_entity) = volume_query.single() {
                 commands.entity(vol_entity).insert((
                     Transform::from_translation(v_center).with_scale(safe_v_size * 1.15),
                     LightProbe {
@@ -1239,9 +1261,6 @@ fn poll_import_dialog(
                         ..default()
                     },
                 ));
-                if existing_vol.is_some() {
-                    commands.entity(vol_entity).remove::<IrradianceVolume>();
-                }
             }
 
             // Aim camera at imported model center
@@ -1302,9 +1321,9 @@ fn update_button_highlights(
             for child in children.iter() {
                 if let Ok(mut text) = text_content_query.get_mut(child) {
                     text.0 = if state.use_baked_raster {
-                        "Raster + Baked GI: ON".into()
+                        "Raster + Baked GI".into()
                     } else {
-                        "Raster + Baked GI: OFF".into()
+                        "Pathtracer Preview".into()
                     };
                 }
             }
@@ -1448,14 +1467,29 @@ fn dispatch_viewport_pt_system(
         state.pt_accum_frames = 0;
     } else {
         state.pt_accum_frames += 1;
-        if state.pt_accum_frames > 8 {
+        let max_accum = if state.use_baked_raster { 1 } else { 8 };
+        if state.pt_accum_frames > max_accum {
             return;
         }
     }
 
     let full_scene_path = resolve_scene_path(&state.scene_path);
 
-    let spp = if cam_moved { 1 } else { 4 };
+    let mode = if state.use_baked_raster { 1 } else { 0 };
+    let spp = if mode == 1 {
+        1
+    } else if cam_moved {
+        1
+    } else {
+        4
+    };
+    let max_bounces = if mode == 1 { 0 } else { state.bounces.min(3) };
+    let irradiance_voxels = if state.use_baked_raster {
+        state.baked_result.as_ref().map(|b| b.raw_floats.clone())
+    } else {
+        None
+    };
+
     let task = ViewportPtTask {
         scene_path: full_scene_path,
         eye,
@@ -1465,8 +1499,13 @@ fn dispatch_viewport_pt_system(
         width: 480,
         height: 380,
         spp,
-        max_bounces: state.bounces.min(3),
+        max_bounces,
         seed: state.pt_accum_frames * 997,
+        mode,
+        bounds_min: state.bounds_min,
+        bounds_max: state.bounds_max,
+        resolution: state.resolution,
+        irradiance_voxels,
     };
 
     if state.pt_task_tx.send(task).is_ok() {
@@ -1480,7 +1519,11 @@ fn poll_viewport_pt_results(
 ) {
     let maybe_res = {
         if let Ok(rx) = state.pt_res_rx.lock() {
-            rx.try_recv().ok()
+            let mut latest = None;
+            while let Ok(res) = rx.try_recv() {
+                latest = Some(res);
+            }
+            latest
         } else {
             None
         }
@@ -1488,9 +1531,11 @@ fn poll_viewport_pt_results(
 
     if let Some(res) = maybe_res {
         state.pt_pending = false;
-        if let Some(ref handle) = state.pt_image_handle {
-            if let Some(mut image) = images.get_mut(handle) {
-                image.data = Some(res.pixels);
+        if !res.pixels.is_empty() {
+            if let Some(ref handle) = state.pt_image_handle {
+                if let Some(mut image) = images.get_mut(handle) {
+                    image.data = Some(res.pixels);
+                }
             }
         }
     }
@@ -1718,46 +1763,41 @@ fn f32_to_f16(f: f32) -> u16 {
 }
 
 fn sync_baked_irradiance_volume(
-    mut commands: Commands,
     state: Res<AppState>,
-    images: Res<Assets<Image>>,
     mut ambient_light: ResMut<GlobalAmbientLight>,
-    volume_query: Query<(Entity, Option<&IrradianceVolume>), With<BakedIrradianceVolume>>,
 ) {
-    let Ok((entity, existing_irradiance)) = volume_query.single() else {
-        return;
-    };
-
     if state.use_baked_raster {
-        if let Some(ref handle) = state.baked_image_handle {
-            if images.get(handle).is_some() && state.gpu_ready_frames >= 2 {
-                let need_update = match existing_irradiance {
-                    Some(vol) => vol.voxels != *handle,
-                    None => true,
-                };
-                if need_update {
-                    commands.entity(entity).insert((
-                        IrradianceVolume {
-                            voxels: handle.clone(),
-                            intensity: 2800.0,
-                            ..default()
-                        },
-                        LightProbe {
-                            falloff: Vec3::splat(0.05),
-                            ..default()
-                        },
-                    ));
+        if let Some(ref baked) = state.baked_result {
+            if !baked.raw_floats.is_empty() {
+                let mut total_r = 0.0f32;
+                let mut total_g = 0.0f32;
+                let mut total_b = 0.0f32;
+                for v in &baked.raw_floats {
+                    total_r += v[0];
+                    total_g += v[1];
+                    total_b += v[2];
                 }
-                ambient_light.brightness = 30.0;
+                let count = baked.raw_floats.len() as f32;
+                let avg_r = total_r / count;
+                let avg_g = total_g / count;
+                let avg_b = total_b / count;
+                let max_c = avg_r.max(avg_g).max(avg_b).max(1e-4);
+                let col = Color::srgb(
+                    (avg_r / max_c * 0.7 + 0.3).clamp(0.0, 1.0),
+                    (avg_g / max_c * 0.7 + 0.3).clamp(0.0, 1.0),
+                    (avg_b / max_c * 0.7 + 0.3).clamp(0.0, 1.0),
+                );
+                ambient_light.color = col;
+                ambient_light.brightness = (max_c * 600.0).clamp(120.0, 1500.0);
                 return;
             }
         }
+        ambient_light.color = Color::WHITE;
+        ambient_light.brightness = 150.0;
+    } else {
+        ambient_light.color = Color::WHITE;
+        ambient_light.brightness = 350.0;
     }
-
-    if existing_irradiance.is_some() {
-        commands.entity(entity).remove::<IrradianceVolume>();
-    }
-    ambient_light.brightness = 350.0;
 }
 
 fn poll_bake_results(
@@ -1837,6 +1877,8 @@ fn poll_bake_results(
                 state.baked_image_handle = Some(handle);
                 state.baked_result = Some(b);
                 state.gpu_ready_frames = 0;
+                state.pt_accum_frames = 0;
+                state.last_cam_eye = Vec3::ZERO;
             }
             BakeTaskResult::Error(err) => {
                 state.status_text = format!("Bake Error: {}", err);
@@ -1858,7 +1900,7 @@ fn update_labels(
         let viewport_desc = if state.use_baked_raster {
             "Raster + Baked GI"
         } else {
-            "Path Tracing Preview"
+            "Pathtracer Preview"
         };
         let baker_desc = if state.is_baking {
             "MuTracer DX12 Path Tracer (Baking...)"

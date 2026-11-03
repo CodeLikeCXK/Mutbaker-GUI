@@ -1,0 +1,25 @@
+{
+  "bounds_max": [
+    0.0,
+    548.7999877929688,
+    0.0
+  ],
+  "bounds_min": [
+    -556.0,
+    0.0,
+    -559.2000122070312
+  ],
+  "dimensions": [
+    8,
+    16,
+    9
+  ],
+  "format": "VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 (Rgb9e5Ufloat)",
+  "resolution": [
+    8,
+    8,
+    3
+  ],
+  "scene": "Cornell Box",
+  "voxels_texture": "CornellBox_Irradiance_Info.ktx2"
+}
