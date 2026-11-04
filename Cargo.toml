@@ -29,7 +29,7 @@ bevy = { path = "C:/Bevy", default-features = false, features = [
     "ktx2",
     "x11",
 ] }
-muttracer-native = { path = "muttracer-native" }
+mutracer-native = { path = "mutracer-native" }
 glam = "0.33.12"
 anyhow = "1.0.100"
 serde = { version = "1.0.228", features = ["derive"] }

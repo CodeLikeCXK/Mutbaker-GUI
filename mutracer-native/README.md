@@ -33,13 +33,13 @@
 
 ### 1. 构建
 ```powershell
-cd C:\tracer-experiment\muttracer-native
+cd C:\tracer-experiment\mutracer-native
 cargo build
 ```
 
 ### 2. 检查 GPU 设备与 DX12 支持
 ```powershell
-.\target\debug\muttracer-native.exe probe-gpu
+.\target\debug\mutracer-native.exe probe-gpu
 ```
 输出示例：
 ```text
@@ -52,7 +52,7 @@ cargo build
 
 ### 3. 烘焙场景为 Bevy Irradiance Volume
 ```powershell
-.\target\debug\muttracer-native.exe bake `
+.\target\debug\mutracer-native.exe bake `
   --scene C:\bevy\assets\models\CornellBox\CornellBox.glb `
   --out cornell.vxgi.ktx2 `
   --resolution 8,8,8 `
@@ -62,7 +62,7 @@ cargo build
 
 ### 4. 校验输出的 KTX2 文件
 ```powershell
-.\target\debug\muttracer-native.exe verify-ktx2 cornell.vxgi.ktx2
+.\target\debug\mutracer-native.exe verify-ktx2 cornell.vxgi.ktx2
 ```
 输出示例：
 ```text

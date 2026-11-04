@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use glam::{UVec3, Vec3};
-use muttracer_native::baker::{bake_irradiance_volume, BakeSettings};
-use muttracer_native::bvh::FlatBvh;
-use muttracer_native::gpu::GpuContext;
-use muttracer_native::scene::Scene;
+use mutracer_native::baker::{bake_irradiance_volume, BakeSettings};
+use mutracer_native::bvh::FlatBvh;
+use mutracer_native::gpu::GpuContext;
+use mutracer_native::scene::Scene;
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -12,9 +12,9 @@ fn print_usage() {
         r#"
 MuTracer Native - Windows ARM64 DX12 Path Tracer & Irradiance Volume Baker
 Usage:
-  muttracer-native bake [options]
-  muttracer-native probe-gpu
-  muttracer-native verify-ktx2 <path.ktx2>
+  mutracer-native bake [options]
+  mutracer-native probe-gpu
+  mutracer-native verify-ktx2 <path.ktx2>
 
 Bake Options:
   --scene <path.glb>          Path to glTF/GLB input scene (required)

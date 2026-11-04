@@ -77,7 +77,7 @@ impl GpuContext {
         );
 
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("muttracer-device"),
+            label: Some("mutracer-device"),
             required_features: wgpu::Features::empty(),
             required_limits: limits.clone(),
             memory_hints: wgpu::MemoryHints::default(),

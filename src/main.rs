@@ -9,12 +9,12 @@ use bevy::render::render_resource::{
     Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
 };
 use glam::UVec3;
-use muttracer_native::baker::{
+use mutracer_native::baker::{
     bake_irradiance_volume, render_viewport_pt, BakeResult, BakeSettings, ViewportPtSettings,
 };
-use muttracer_native::bvh::FlatBvh;
-use muttracer_native::gpu::GpuContext;
-use muttracer_native::scene::Scene as NativeScene;
+use mutracer_native::bvh::FlatBvh;
+use mutracer_native::gpu::GpuContext;
+use mutracer_native::scene::Scene as NativeScene;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;

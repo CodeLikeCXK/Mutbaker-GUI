@@ -2955,14 +2955,14 @@ dependencies = [
  "bytemuck",
  "glam",
  "ktx2",
- "muttracer-native",
+ "mutracer-native",
  "naga",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "muttracer-native"
+name = "mutracer-native"
 version = "0.1.0"
 dependencies = [
  "anyhow",
