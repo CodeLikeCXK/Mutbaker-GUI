@@ -65,6 +65,9 @@ fn run_bake(args: &[String]) -> Result<()> {
     let mut spp = 64u32;
     let mut max_bounces = 2u32;
     let mut custom_bounds: Option<(Vec3, Vec3)> = None;
+    let mut custom_sun_dir: Option<Vec3> = None;
+    let mut custom_sun_color: Option<Vec3> = None;
+    let mut custom_sun_intensity: Option<f32> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -124,6 +127,38 @@ fn run_bake(args: &[String]) -> Result<()> {
                     }
                 }
             }
+            "--sun-dir" => {
+                i += 1;
+                if i < args.len() {
+                    let parts: Vec<f32> = args[i]
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+                    if parts.len() == 3 {
+                        custom_sun_dir = Some(Vec3::new(parts[0], parts[1], parts[2]).normalize());
+                    }
+                }
+            }
+            "--sun-color" => {
+                i += 1;
+                if i < args.len() {
+                    let parts: Vec<f32> = args[i]
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+                    if parts.len() == 3 {
+                        custom_sun_color = Some(Vec3::new(parts[0], parts[1], parts[2]));
+                    }
+                }
+            }
+            "--sun-intensity" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(v) = args[i].parse() {
+                        custom_sun_intensity = Some(v);
+                    }
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -145,12 +180,25 @@ fn run_bake(args: &[String]) -> Result<()> {
         (scene.bounds_min - margin, scene.bounds_max + margin)
     });
 
+    let (sun_dir, sun_color, sun_intensity) = if let Some(ref sun) = scene.directional_light {
+        (
+            custom_sun_dir.or(Some(sun.direction)),
+            custom_sun_color.or(Some(sun.color)),
+            custom_sun_intensity.or(Some(sun.intensity)),
+        )
+    } else {
+        (custom_sun_dir, custom_sun_color, custom_sun_intensity)
+    };
+
     let settings = BakeSettings {
         resolution,
         bounds_min: b_min,
         bounds_max: b_max,
         spp,
         max_bounces,
+        sun_dir,
+        sun_color,
+        sun_intensity,
     };
 
     let result = bake_irradiance_volume(&gpu, &bvh, &settings)?;

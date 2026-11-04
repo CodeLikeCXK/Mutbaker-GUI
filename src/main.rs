@@ -14,7 +14,7 @@ use mutracer_native::baker::{
 };
 use mutracer_native::bvh::FlatBvh;
 use mutracer_native::gpu::GpuContext;
-use mutracer_native::scene::Scene as NativeScene;
+use mutracer_native::scene::{DirectionalLightData, Scene as NativeScene};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
@@ -102,6 +102,8 @@ pub struct AppState {
     pub pt_accum_frames: u32,
     pub last_cam_eye: Vec3,
     pub last_cam_center: Vec3,
+    pub glb_sun: Option<DirectionalLightData>,
+    pub enable_mutbaker_sun: bool,
 }
 
 pub struct BakeTask {
@@ -130,6 +132,9 @@ pub struct ViewportPtTask {
     pub bounds_max: Vec3,
     pub resolution: UVec3,
     pub irradiance_voxels: Option<Vec<[f32; 4]>>,
+    pub sun_dir: Option<Vec3>,
+    pub sun_color: Option<Vec3>,
+    pub sun_intensity: Option<f32>,
 }
 
 pub struct ViewportPtResult {
@@ -177,6 +182,7 @@ pub enum UiAction {
     StartBake,
     ToggleBakedRaster,
     ToggleProbeGrid,
+    ToggleSun,
     ExportOutput,
 }
 
@@ -330,6 +336,9 @@ fn main() {
 
         let mut cached_path: Option<PathBuf> = None;
         let mut cached_bvh: Option<FlatBvh> = None;
+        let mut cached_sun_dir: Option<Vec3> = None;
+        let mut cached_sun_color: Option<Vec3> = None;
+        let mut cached_sun_intensity: Option<f32> = None;
 
         while let Ok(task) = pt_task_rx.recv() {
             let mut latest_task = task;
@@ -346,6 +355,15 @@ fn main() {
                 match NativeScene::load_gltf(&latest_task.scene_path) {
                     Ok(scene) => {
                         cached_bvh = Some(FlatBvh::build(&scene));
+                        if let Some(ref sun) = scene.directional_light {
+                            cached_sun_dir = Some(sun.direction);
+                            cached_sun_color = Some(sun.color);
+                            cached_sun_intensity = Some(sun.intensity);
+                        } else {
+                            cached_sun_dir = None;
+                            cached_sun_color = None;
+                            cached_sun_intensity = None;
+                        }
                         cached_path = Some(latest_task.scene_path.clone());
                     }
                     Err(e) => {
@@ -370,6 +388,9 @@ fn main() {
                     bounds_max: latest_task.bounds_max,
                     resolution: latest_task.resolution,
                     irradiance_voxels: latest_task.irradiance_voxels,
+                    sun_dir: latest_task.sun_dir.or(cached_sun_dir),
+                    sun_color: latest_task.sun_color.or(cached_sun_color),
+                    sun_intensity: latest_task.sun_intensity.or(cached_sun_intensity),
                 };
 
                 match render_viewport_pt(&gpu, bvh, &settings) {
@@ -460,6 +481,8 @@ fn main() {
             pt_accum_frames: 0,
             last_cam_eye: Vec3::ZERO,
             last_cam_center: Vec3::ZERO,
+            glb_sun: None,
+            enable_mutbaker_sun: false, // Mutbaker自身光源默认关闭
         })
         .add_systems(Startup, setup)
         .add_systems(
@@ -477,6 +500,7 @@ fn main() {
                 poll_bake_results,
                 poll_import_dialog,
                 update_labels,
+                cleanup_gltf_duplicate_lights,
             ),
         )
         .add_observer(handle_ui_click)
@@ -491,11 +515,28 @@ fn advance_gpu_frame_counter(mut state: ResMut<AppState>) {
     }
 }
 
+fn cleanup_gltf_duplicate_lights(
+    mut commands: Commands,
+    lights: Query<Entity, (With<DirectionalLight>, Without<MainSunLight>)>,
+) {
+    for e in &lights {
+        commands.entity(e).despawn();
+    }
+}
+
 fn run_gpu_bake(task: BakeTask) -> anyhow::Result<BakeResult> {
     let gpu = GpuContext::new_dx12()?;
     let scene = NativeScene::load_gltf(&task.scene_path)?;
     let bvh = FlatBvh::build(&scene);
-    bake_irradiance_volume(&gpu, &bvh, &task.settings)
+    let mut settings = task.settings;
+    if settings.sun_dir.is_none() {
+        if let Some(ref sun) = scene.directional_light {
+            settings.sun_dir = Some(sun.direction);
+            settings.sun_color = Some(sun.color);
+            settings.sun_intensity = Some(sun.intensity);
+        }
+    }
+    bake_irradiance_volume(&gpu, &bvh, &settings)
 }
 
 fn setup(
@@ -530,16 +571,17 @@ fn setup(
         IsDefaultUiCamera,
     ));
 
-    // Directional Sunlight & Ambient Light - sharp, bright aperture lighting
+    // Directional Sunlight - Mutbaker's own light source is disabled by default
     commands.spawn((
         DirectionalLight {
-            shadow_maps_enabled: true,
-            illuminance: 16000.0,
+            shadow_maps_enabled: false,
+            illuminance: 0.0,
             shadow_depth_bias: 0.02,
             shadow_normal_bias: 1.8,
             ..default()
         },
         Transform::from_xyz(20.0, 50.0, 30.0).looking_at(sc.cam_center, Vec3::Y),
+        Visibility::Hidden,
         MainSunLight,
     ));
 
@@ -787,6 +829,11 @@ fn build_ui(commands: &mut Commands) {
                         "Toggle Probe Grid",
                         UiAction::ToggleProbeGrid,
                     );
+                    panel_button(
+                        panel,
+                        "Mutbaker Sun: OFF",
+                        UiAction::ToggleSun,
+                    );
                 });
             });
         });
@@ -937,7 +984,70 @@ fn is_action_selected(action: &UiAction, state: &AppState) -> bool {
         }
         UiAction::ToggleProbeGrid => state.show_probe_grid,
         UiAction::ToggleBakedRaster => state.use_baked_raster,
+        UiAction::ToggleSun => state.glb_sun.is_some() || state.enable_mutbaker_sun,
         _ => false,
+    }
+}
+
+fn apply_scene_sunlight(
+    sun: Option<&DirectionalLightData>,
+    enable_mutbaker_sun: bool,
+    v_center: Vec3,
+    scene_radius: f32,
+    light_query: &mut Query<
+        (&mut Transform, &mut DirectionalLight, &mut Visibility),
+        (With<MainSunLight>, Without<OrbitCamera>, Without<SceneModelRoot>),
+    >,
+) {
+    let Ok((mut light_trans, mut dir_light, mut vis)) = light_query.single_mut() else {
+        return;
+    };
+
+    if let Some(sun) = sun {
+        *vis = Visibility::Inherited;
+        dir_light.shadow_maps_enabled = true;
+        // Direct lux illuminance (clamped to realistic daylight range)
+        dir_light.illuminance = if sun.intensity > 100.0 {
+            sun.intensity.clamp(1_000.0, 300_000.0)
+        } else {
+            (sun.intensity * 30_000.0).clamp(1_000.0, 300_000.0)
+        };
+        dir_light.color = Color::srgb(
+            sun.color.x.clamp(0.0, 1.0),
+            sun.color.y.clamp(0.0, 1.0),
+            sun.color.z.clamp(0.0, 1.0),
+        );
+        dir_light.shadow_depth_bias = 0.02;
+        dir_light.shadow_normal_bias = 1.8;
+
+        // sun.direction points FROM surface TOWARDS the sun.
+        // Placing the light source at v_center + sun.direction * dist looking at v_center
+        // ensures light.forward() is -sun.direction, correctly illuminating scene surfaces.
+        let up = if sun.direction.abs().y > 0.99 { Vec3::Z } else { Vec3::Y };
+        let light_dist = scene_radius.max(5.0) * 2.5;
+        light_trans.translation = v_center + sun.direction * light_dist;
+        light_trans.look_at(v_center, up);
+        eprintln!(
+            "[mutbaker] Applied glTF Sunlight: dir {:?}, color {:?}, illuminance {}",
+            sun.direction, sun.color, dir_light.illuminance
+        );
+    } else if enable_mutbaker_sun {
+        *vis = Visibility::Inherited;
+        dir_light.shadow_maps_enabled = true;
+        dir_light.illuminance = 16000.0;
+        dir_light.color = Color::WHITE;
+        dir_light.shadow_depth_bias = 0.02;
+        dir_light.shadow_normal_bias = 1.8;
+        let light_dir = Vec3::new(1.0, 1.8, 1.2).normalize();
+        let light_dist = scene_radius.max(5.0) * 2.0;
+        light_trans.translation = v_center + light_dir * light_dist;
+        light_trans.look_at(v_center, Vec3::Y);
+        eprintln!("[mutbaker] Enabled Mutbaker fallback sunlight.");
+    } else {
+        *vis = Visibility::Hidden;
+        dir_light.illuminance = 0.0;
+        dir_light.shadow_maps_enabled = false;
+        eprintln!("[mutbaker] Sunlight is OFF (default).");
     }
 }
 
@@ -952,7 +1062,7 @@ fn handle_ui_click(
     scene_model_query: Query<Entity, With<SceneModelRoot>>,
     mut cam_query: Query<(&mut Transform, &mut OrbitCamera), (Without<SceneModelRoot>, Without<MainSunLight>)>,
     volume_query: Query<Entity, With<BakedIrradianceVolume>>,
-    mut dir_light_query: Query<&mut Transform, (With<MainSunLight>, Without<OrbitCamera>, Without<SceneModelRoot>)>,
+    mut dir_light_query: Query<(&mut Transform, &mut DirectionalLight, &mut Visibility), (With<MainSunLight>, Without<OrbitCamera>, Without<SceneModelRoot>)>,
 ) {
     let Some(action) = get_action_from_entity(click.entity, &query, &parents) else {
         return;
@@ -1027,11 +1137,20 @@ fn handle_ui_click(
                 transform.look_at(cam.center, Vec3::Y);
             }
 
-            // Reset DirectionalLight back to scene sunlight
-            if let Ok(mut light_transform) = dir_light_query.single_mut() {
-                light_transform.translation = Vec3::new(20.0, 50.0, 30.0);
-                light_transform.look_at(sc.cam_center, Vec3::Y);
-            }
+            // Load glTF sunlight if available for preset scene
+            let full_scene_path = resolve_scene_path(sc.asset_path);
+            let native_scene = NativeScene::load_gltf(&full_scene_path).ok();
+            state.glb_sun = native_scene.as_ref().and_then(|s| s.directional_light.clone());
+
+            let v_center = sc.cam_center;
+            let v_size = (sc.bounds_max - sc.bounds_min) * sc.visual_scale;
+            apply_scene_sunlight(
+                state.glb_sun.as_ref(),
+                state.enable_mutbaker_sun,
+                v_center,
+                v_size.length() * 0.5,
+                &mut dir_light_query,
+            );
 
             state.status_text = format!("Loaded: {}", sc.display_name);
         }
@@ -1053,6 +1172,28 @@ fn handle_ui_click(
                 "Probe Grid: {}",
                 if state.show_probe_grid { "ON" } else { "OFF" }
             );
+        }
+        UiAction::ToggleSun => {
+            if state.glb_sun.is_none() {
+                state.enable_mutbaker_sun = !state.enable_mutbaker_sun;
+                let v_center = (state.bounds_min + state.bounds_max) * 0.5 * state.visual_scale;
+                let v_size = (state.bounds_max - state.bounds_min) * state.visual_scale;
+                apply_scene_sunlight(
+                    None,
+                    state.enable_mutbaker_sun,
+                    v_center,
+                    v_size.length() * 0.5,
+                    &mut dir_light_query,
+                );
+                state.pt_pending = false;
+                state.pt_accum_frames = 0;
+                state.status_text = format!(
+                    "Mutbaker Sun: {}",
+                    if state.enable_mutbaker_sun { "ON" } else { "OFF" }
+                );
+            } else {
+                state.status_text = "Sun is provided by GLB scene (Active)".into();
+            }
         }
         UiAction::ToggleBakedRaster => {
             state.use_baked_raster = !state.use_baked_raster;
@@ -1079,6 +1220,15 @@ fn handle_ui_click(
 
                 let full_scene_path = resolve_scene_path(&state.scene_path);
 
+                let (sun_dir, sun_color, sun_intensity) = if let Some(ref sun) = state.glb_sun {
+                    (Some(sun.direction), Some(sun.color), Some(sun.intensity))
+                } else if state.enable_mutbaker_sun {
+                    let dir = dir_light_query.single().ok().map(|(t, _, _)| -*t.forward());
+                    (dir, Some(Vec3::new(1.0, 0.98, 0.92)), Some(1.0))
+                } else {
+                    (None, None, None)
+                };
+
                 let task = BakeTask {
                     scene_path: full_scene_path,
                     settings: BakeSettings {
@@ -1087,6 +1237,9 @@ fn handle_ui_click(
                         bounds_max: state.bounds_max,
                         spp: state.spp,
                         max_bounces: state.bounces,
+                        sun_dir,
+                        sun_color,
+                        sun_intensity,
                     },
                 };
                 let _ = state.bake_tx.send(task);
@@ -1165,7 +1318,7 @@ fn poll_import_dialog(
     scene_model_query: Query<Entity, With<SceneModelRoot>>,
     mut cam_query: Query<(&mut Transform, &mut OrbitCamera), (Without<SceneModelRoot>, Without<MainSunLight>)>,
     volume_query: Query<Entity, With<BakedIrradianceVolume>>,
-    mut dir_light_query: Query<&mut Transform, (With<MainSunLight>, Without<OrbitCamera>, Without<SceneModelRoot>)>,
+    mut dir_light_query: Query<(&mut Transform, &mut DirectionalLight, &mut Visibility), (With<MainSunLight>, Without<OrbitCamera>, Without<SceneModelRoot>)>,
 ) {
     let maybe_path = {
         if let Ok(rx) = import_channel.rx.lock() {
@@ -1279,17 +1432,25 @@ fn poll_import_dialog(
                 transform.look_at(cam.center, Vec3::Y);
             }
 
-            // Adjust directional light to illuminate imported scene from above
-            if let Ok(mut light_transform) = dir_light_query.single_mut() {
-                let light_dir = Vec3::new(1.0, 1.8, 1.2).normalize();
-                let light_dist = v_size.length() * 1.5;
-                light_transform.translation = v_center + light_dir * light_dist;
-                light_transform.look_at(v_center, Vec3::Y);
-            }
+            // Apply glTF sunlight from imported model or keep Mutbaker sun off by default
+            state.glb_sun = native_scene.directional_light.clone();
+            apply_scene_sunlight(
+                state.glb_sun.as_ref(),
+                state.enable_mutbaker_sun,
+                v_center,
+                safe_v_size.length() * 0.5,
+                &mut dir_light_query,
+            );
+
+            let sun_status = if let Some(ref sun) = state.glb_sun {
+                format!("Sun: {:?} ({:.0} lux)", sun.direction, sun.intensity)
+            } else {
+                "Sun: None (Mutbaker Sun OFF)".to_string()
+            };
 
             state.status_text = format!(
-                "Imported: {} ({} Tris, size {:.1}x{:.1}x{:.1})",
-                file_name, state.triangle_count, extents.x, extents.y, extents.z
+                "Imported: {} ({} Tris) | {}",
+                file_name, state.triangle_count, sun_status
             );
         } else {
             state.status_text = format!("Failed to parse glTF: {}", file_name);
@@ -1316,7 +1477,7 @@ fn update_button_highlights(
     for (_, action, mut bg, mut border, children) in &mut buttons {
         let is_selected = is_action_selected(action, &state);
 
-        // Update button text for dynamic buttons like ToggleBakedRaster
+        // Update button text for dynamic buttons like ToggleBakedRaster and ToggleSun
         if matches!(action, UiAction::ToggleBakedRaster) {
             for child in children.iter() {
                 if let Ok(mut text) = text_content_query.get_mut(child) {
@@ -1324,6 +1485,19 @@ fn update_button_highlights(
                         "Raster + Baked GI".into()
                     } else {
                         "Pathtracer Preview".into()
+                    };
+                }
+            }
+        }
+        if matches!(action, UiAction::ToggleSun) {
+            for child in children.iter() {
+                if let Ok(mut text) = text_content_query.get_mut(child) {
+                    text.0 = if state.glb_sun.is_some() {
+                        "Sun: GLB (Active)".into()
+                    } else if state.enable_mutbaker_sun {
+                        "Mutbaker Sun: ON".into()
+                    } else {
+                        "Mutbaker Sun: OFF".into()
                     };
                 }
             }
@@ -1434,6 +1608,7 @@ fn orbit_camera_controller(
 fn dispatch_viewport_pt_system(
     mut state: ResMut<AppState>,
     cam_query: Query<(&Transform, &OrbitCamera)>,
+    sun_light_query: Query<(&Transform, &DirectionalLight), With<MainSunLight>>,
 ) {
     if state.use_baked_raster {
         return;
@@ -1445,6 +1620,20 @@ fn dispatch_viewport_pt_system(
 
     let Ok((cam_trans, cam)) = cam_query.single() else {
         return;
+    };
+
+    let (sun_dir, sun_color, sun_intensity) = if let Some(ref sun) = state.glb_sun {
+        (Some(sun.direction), Some(sun.color), Some(sun.intensity))
+    } else if state.enable_mutbaker_sun {
+        if let Ok((light_trans, light)) = sun_light_query.single() {
+            let dir = -*light_trans.forward();
+            let color = Vec3::new(light.color.to_linear().red, light.color.to_linear().green, light.color.to_linear().blue);
+            (Some(dir), Some(color), Some(1.0))
+        } else {
+            (None, None, None)
+        }
+    } else {
+        (None, None, None)
     };
 
     let visual_scale = if state.visual_scale.abs() > 1e-6 {
@@ -1506,6 +1695,9 @@ fn dispatch_viewport_pt_system(
         bounds_max: state.bounds_max,
         resolution: state.resolution,
         irradiance_voxels,
+        sun_dir,
+        sun_color,
+        sun_intensity,
     };
 
     if state.pt_task_tx.send(task).is_ok() {
@@ -1711,7 +1903,7 @@ fn draw_probe_gizmos(mut gizmos: Gizmos, state: Res<AppState>) {
                 let vp = p * visual_scale;
 
                 // Calculate light direction for this probe
-                let (dominant_dir, arrow_color) = if let Some(ref baked) = state.baked_result {
+                let (dominant_dir, arrow_color, show_arrow) = if let Some(ref baked) = state.baked_result {
                     let f_px = baked.raw_floats[idx(vx, vy, vz)];
                     let f_nx = baked.raw_floats[idx(vx, vy + ry, vz)];
                     let f_py = baked.raw_floats[idx(vx, vy, vz + rz)];
@@ -1730,14 +1922,19 @@ fn draw_probe_gizmos(mut gizmos: Gizmos, state: Res<AppState>) {
                     } else {
                         Vec3::Y
                     };
-                    (dir, Color::srgb(1.0, 0.85, 0.25)) // Warm golden arrow indicating baked light direction
+                    (dir, Color::srgb(1.0, 0.85, 0.25), true) // Warm golden arrow indicating baked light direction
+                } else if let Some(ref sun) = state.glb_sun {
+                    (sun.direction, Color::srgb(1.0, 0.90, 0.40), true) // GLB sunlight direction arrow
+                } else if state.enable_mutbaker_sun {
+                    (Vec3::new(1.0, 1.8, 1.2).normalize(), Color::srgb(1.0, 0.90, 0.40), true)
                 } else {
-                    let dir = Vec3::new(20.0, 50.0, 30.0).normalize();
-                    (dir, Color::srgb(1.0, 0.90, 0.40)) // Sunlight direction arrow
+                    (Vec3::Y, Color::WHITE, false)
                 };
 
                 // Draw prominent directional pointer from the center of the sphere outward
-                gizmos.arrow(vp, vp + dominant_dir * (radius * 2.2), arrow_color);
+                if show_arrow {
+                    gizmos.arrow(vp, vp + dominant_dir * (radius * 2.2), arrow_color);
+                }
             }
         }
     }
@@ -1909,9 +2106,17 @@ fn update_labels(
         } else {
             "MuTracer DX12 Path Tracer (Active)"
         };
+        let sun_desc = if let Some(ref sun) = state.glb_sun {
+            format!("GLB Sun ({:.0} lux)", sun.intensity)
+        } else if state.enable_mutbaker_sun {
+            "Mutbaker Sun (ON)".to_string()
+        } else {
+            "OFF (Default)".to_string()
+        };
         text.0 = format!(
-            "Model: {}\nViewport: {}\nBaker: {}\nGrid: {}x{}x{} ({} Probes)\nSPP: {} | Bounces: {}",
+            "Model: {}\nSun: {}\nViewport: {}\nBaker: {}\nGrid: {}x{}x{} ({} Probes)\nSPP: {} | Bounces: {}",
             state.scene_name,
+            sun_desc,
             viewport_desc,
             baker_desc,
             state.resolution.x,

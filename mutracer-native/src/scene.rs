@@ -50,6 +50,13 @@ impl Default for Material {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DirectionalLightData {
+    pub direction: Vec3, // Unit vector pointing towards the light source
+    pub color: Vec3,
+    pub intensity: f32,
+}
+
 pub struct Scene {
     pub triangles: Vec<Triangle>,
     pub materials: Vec<Material>,
@@ -58,6 +65,7 @@ pub struct Scene {
     pub texture_size: u32,
     pub bounds_min: Vec3,
     pub bounds_max: Vec3,
+    pub directional_light: Option<DirectionalLightData>,
 }
 
 fn sample_pixel_rgba_u8(data: &[u8], format: gltf::image::Format, x: usize, y: usize, w: usize) -> [u8; 4] {
@@ -209,6 +217,7 @@ impl Scene {
         let mut triangles = Vec::new();
         let mut scene_min = Vec3::splat(f32::INFINITY);
         let mut scene_max = Vec3::splat(f32::NEG_INFINITY);
+        let mut directional_light: Option<DirectionalLightData> = None;
 
         for scene in document.scenes() {
             for node in scene.nodes() {
@@ -220,6 +229,7 @@ impl Scene {
                     &mut triangles,
                     &mut scene_min,
                     &mut scene_max,
+                    &mut directional_light,
                 );
             }
         }
@@ -240,6 +250,12 @@ impl Scene {
             "[scene] Bounds: min [{}, {}, {}], max [{}, {}, {}]",
             scene_min.x, scene_min.y, scene_min.z, scene_max.x, scene_max.y, scene_max.z
         );
+        if let Some(ref sun) = directional_light {
+            eprintln!(
+                "[scene] Found glTF DirectionalLight: dir {:?}, color {:?}, intensity {}",
+                sun.direction, sun.color, sun.intensity
+            );
+        }
 
         Ok(Self {
             triangles,
@@ -249,6 +265,7 @@ impl Scene {
             texture_size,
             bounds_min: scene_min,
             bounds_max: scene_max,
+            directional_light,
         })
     }
 }
@@ -261,10 +278,26 @@ fn load_node_recursive(
     out_triangles: &mut Vec<Triangle>,
     scene_min: &mut Vec3,
     scene_max: &mut Vec3,
+    directional_light: &mut Option<DirectionalLightData>,
 ) {
     let local_transform = Mat4::from_cols_array_2d(&node.transform().matrix());
     let world_transform = parent_transform * local_transform;
     let normal_matrix = world_transform.inverse().transpose();
+
+    if directional_light.is_none() {
+        if let Some(light) = node.light() {
+            if matches!(light.kind(), gltf::khr_lights_punctual::Kind::Directional) {
+                let sun_dir = world_transform.transform_vector3(Vec3::Z).normalize_or_zero();
+                let color = Vec3::from_array(light.color());
+                let intensity = light.intensity();
+                *directional_light = Some(DirectionalLightData {
+                    direction: if sun_dir.length_squared() > 1e-4 { sun_dir } else { Vec3::new(0.32, 0.81, 0.49).normalize() },
+                    color,
+                    intensity,
+                });
+            }
+        }
+    }
 
     if let Some(mesh) = node.mesh() {
         for primitive in mesh.primitives() {
@@ -349,6 +382,7 @@ fn load_node_recursive(
             out_triangles,
             scene_min,
             scene_max,
+            directional_light,
         );
     }
 }

@@ -13,14 +13,20 @@ pub struct BakeUniforms {
     pub bounds_max: [f32; 4],
     pub resolution: [u32; 4], // rx, ry, rz, spp
     pub params: [u32; 4],     // max_bounces, rng_seed, total_voxels, pad
+    pub sun_dir: [f32; 4],    // xyz = sun direction, w = enabled flag (1.0 or 0.0)
+    pub sun_color: [f32; 4],  // rgb = sun color, w = intensity
 }
 
+#[derive(Clone, Debug)]
 pub struct BakeSettings {
     pub resolution: UVec3, // Rx, Ry, Rz
     pub bounds_min: Vec3,
     pub bounds_max: Vec3,
     pub spp: u32,
     pub max_bounces: u32,
+    pub sun_dir: Option<Vec3>,
+    pub sun_color: Option<Vec3>,
+    pub sun_intensity: Option<f32>,
 }
 
 pub struct BakeResult {
@@ -39,6 +45,8 @@ struct BakeUniforms {
     bounds_max: vec4f,
     resolution: vec4u, // rx, ry, rz, spp
     params: vec4u,     // max_bounces, rng_seed, total_voxels, pad
+    sun_dir: vec4f,    // xyz = sun direction, w = enabled flag (1.0 or 0.0)
+    sun_color: vec4f,  // rgb = sun color, w = intensity
 };
 
 struct GpuBvhNode {
@@ -295,14 +303,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
             let hit_p = ray_o + cur_dir * hit.t + hit_n * eps;
 
-            // Directional Sunlight (matching scene sunlight in viewport)
-            let sun_dir = normalize(vec3f(0.32, 0.81, 0.49));
-            let n_dot_sun = max(0.0, dot(hit_n, sun_dir));
-            if (n_dot_sun > 0.0) {
-                let shadow_hit = trace_ray(hit_p, sun_dir, 1e4);
-                if (shadow_hit.tri_idx == 0xFFFFFFFFu) {
-                    let sun_radiance = vec3f(1.0, 0.98, 0.92) * (0.85 * n_dot_sun);
-                    ray_rad += throughput * albedo * sun_radiance;
+            // Directional Sunlight (dynamic from uniforms/scene)
+            if (u.sun_dir.w > 0.5) {
+                let sun_dir = normalize(u.sun_dir.xyz);
+                let n_dot_sun = max(0.0, dot(hit_n, sun_dir));
+                if (n_dot_sun > 0.0) {
+                    let shadow_hit = trace_ray(hit_p, sun_dir, 1e4);
+                    if (shadow_hit.tri_idx == 0xFFFFFFFFu) {
+                        let sun_radiance = u.sun_color.rgb * (u.sun_color.w * n_dot_sun);
+                        ray_rad += throughput * albedo * sun_radiance;
+                    }
                 }
             }
 
@@ -413,11 +423,24 @@ pub fn bake_irradiance_volume(
         tex_w, tex_h, tex_d, total_texels, settings.spp, settings.max_bounces
     );
 
+    let (sun_d, sun_enabled) = match settings.sun_dir {
+        Some(d) if d.length_squared() > 1e-4 => (d.normalize(), 1.0f32),
+        _ => (Vec3::Y, 0.0f32),
+    };
+    let sun_col = settings.sun_color.unwrap_or(Vec3::new(1.0, 0.98, 0.92));
+    let sun_int = match settings.sun_intensity {
+        Some(i) if i > 100.0 => (i / 100_000.0) * 3.0,
+        Some(i) => i,
+        None => 2.8,
+    };
+
     let uniforms = BakeUniforms {
         bounds_min: [settings.bounds_min.x, settings.bounds_min.y, settings.bounds_min.z, 0.0],
         bounds_max: [settings.bounds_max.x, settings.bounds_max.y, settings.bounds_max.z, 0.0],
         resolution: [rx, ry, rz, settings.spp],
         params: [settings.max_bounces, 1337, total_voxels, 0],
+        sun_dir: [sun_d.x, sun_d.y, sun_d.z, sun_enabled],
+        sun_color: [sun_col.x, sun_col.y, sun_col.z, sun_int],
     };
 
     let uniform_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -686,6 +709,8 @@ pub struct ViewportPtUniforms {
     pub dims: [u32; 4],   // width, height, spp, max_bounces
     pub params: [u32; 4], // rng_seed, mode (0=PT, 1=Raster+BakedGI), has_irradiance, pad
     pub grid_res: [u32; 4], // rx, ry, rz, pad
+    pub sun_dir: [f32; 4],  // xyz = sun direction, w = enabled flag (1.0 or 0.0)
+    pub sun_color: [f32; 4],// rgb = sun color, w = intensity
 }
 
 #[derive(Clone, Debug)]
@@ -704,6 +729,9 @@ pub struct ViewportPtSettings {
     pub bounds_max: Vec3,
     pub resolution: UVec3,
     pub irradiance_voxels: Option<Vec<[f32; 4]>>,
+    pub sun_dir: Option<Vec3>,
+    pub sun_color: Option<Vec3>,
+    pub sun_intensity: Option<f32>,
 }
 
 const VIEWPORT_SHADER_SRC: &str = r#"
@@ -717,6 +745,8 @@ struct ViewportPtUniforms {
     dims: vec4u,     // width, height, spp, max_bounces
     params: vec4u,   // rng_seed, mode, has_irradiance, pad
     grid_res: vec4u, // rx, ry, rz, pad
+    sun_dir: vec4f,
+    sun_color: vec4f,
 };
 
 struct GpuBvhNode {
@@ -982,14 +1012,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             let eps = max(0.003, hit.t * 0.0005);
             let hit_p = ray_o + ray_dir * hit.t + hit_n * eps;
 
-            // Direct Sunlight
-            let sun_dir = normalize(vec3f(0.32, 0.81, 0.49));
-            let n_dot_sun = max(0.0, dot(hit_n, sun_dir));
+            // Direct Sunlight (dynamic from uniforms/scene)
             var sun_radiance = vec3f(0.0);
-            if (n_dot_sun > 0.0) {
-                let shadow_hit = trace_ray(hit_p, sun_dir, 1e5);
-                if (shadow_hit.tri_idx == 0xFFFFFFFFu) {
-                    sun_radiance = vec3f(1.0, 0.98, 0.92) * (1.35 * n_dot_sun);
+            if (u.sun_dir.w > 0.5) {
+                let sun_dir = normalize(u.sun_dir.xyz);
+                let n_dot_sun = max(0.0, dot(hit_n, sun_dir));
+                if (n_dot_sun > 0.0) {
+                    let shadow_hit = trace_ray(hit_p, sun_dir, 1e5);
+                    if (shadow_hit.tri_idx == 0xFFFFFFFFu) {
+                        sun_radiance = u.sun_color.rgb * (u.sun_color.w * n_dot_sun);
+                    }
                 }
             }
 
@@ -1063,14 +1095,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             let eps = max(0.003, hit.t * 0.0005);
             let hit_p = ray_o + cur_dir * hit.t + hit_n * eps;
 
-            // Direct Sunlight
-            let sun_dir = normalize(vec3f(0.32, 0.81, 0.49));
-            let n_dot_sun = max(0.0, dot(hit_n, sun_dir));
-            if (n_dot_sun > 0.0) {
-                let shadow_hit = trace_ray(hit_p, sun_dir, 1e5);
-                if (shadow_hit.tri_idx == 0xFFFFFFFFu) {
-                    let sun_radiance = vec3f(1.0, 0.98, 0.92) * (1.35 * n_dot_sun);
-                    ray_rad += throughput * albedo * sun_radiance;
+            // Direct Sunlight (dynamic from uniforms/scene)
+            if (u.sun_dir.w > 0.5) {
+                let sun_dir = normalize(u.sun_dir.xyz);
+                let n_dot_sun = max(0.0, dot(hit_n, sun_dir));
+                if (n_dot_sun > 0.0) {
+                    let shadow_hit = trace_ray(hit_p, sun_dir, 1e5);
+                    if (shadow_hit.tri_idx == 0xFFFFFFFFu) {
+                        let sun_radiance = u.sun_color.rgb * (u.sun_color.w * n_dot_sun);
+                        ray_rad += throughput * albedo * sun_radiance;
+                    }
                 }
             }
 
@@ -1128,6 +1162,17 @@ pub fn render_viewport_pt(
     let output_byte_len = (total_pixels * 4) as u64;
 
     let has_irr = if settings.irradiance_voxels.as_ref().map_or(false, |v| !v.is_empty()) { 1 } else { 0 };
+    let (sun_d, sun_enabled) = match settings.sun_dir {
+        Some(d) if d.length_squared() > 1e-4 => (d.normalize(), 1.0f32),
+        _ => (Vec3::Y, 0.0f32),
+    };
+    let sun_col = settings.sun_color.unwrap_or(Vec3::new(1.0, 0.98, 0.92));
+    let sun_int = match settings.sun_intensity {
+        Some(i) if i > 100.0 => (i / 100_000.0) * 3.0,
+        Some(i) => i,
+        None => 2.8,
+    };
+
     let uniforms = ViewportPtUniforms {
         eye: [settings.eye.x, settings.eye.y, settings.eye.z, 0.0],
         forward: [settings.forward.x, settings.forward.y, settings.forward.z, 0.0],
@@ -1138,6 +1183,8 @@ pub fn render_viewport_pt(
         dims: [width, height, settings.spp, settings.max_bounces],
         params: [settings.seed, settings.mode, has_irr, 0],
         grid_res: [settings.resolution.x, settings.resolution.y, settings.resolution.z, 0],
+        sun_dir: [sun_d.x, sun_d.y, sun_d.z, sun_enabled],
+        sun_color: [sun_col.x, sun_col.y, sun_col.z, sun_int],
     };
 
     let uniform_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1463,6 +1510,9 @@ mod tests {
             bounds_max: glam::Vec3::new(0.0, 548.8, 0.0),
             resolution: glam::UVec3::new(4, 4, 4),
             irradiance_voxels: None,
+            sun_dir: scene.directional_light.as_ref().map(|s| s.direction),
+            sun_color: scene.directional_light.as_ref().map(|s| s.color),
+            sun_intensity: scene.directional_light.as_ref().map(|s| s.intensity),
         };
         let res = render_viewport_pt(&gpu, &bvh, &settings);
         match res {
