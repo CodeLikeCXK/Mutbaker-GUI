@@ -41,10 +41,18 @@ pub struct GpuMaterial {
     pub tex_index: [i32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct GpuPointLight {
+    pub position_range: [f32; 4],  // xyz = world position, w = inverse_range_squared (0.0 if unbounded)
+    pub color_intensity: [f32; 4], // rgb = linear color, w = intensity (candela)
+}
+
 pub struct FlatBvh {
     pub nodes: Vec<GpuBvhNode>,
     pub triangles: Vec<GpuTriangle>,
     pub materials: Vec<GpuMaterial>,
+    pub point_lights: Vec<GpuPointLight>,
     pub texture_array: Vec<u8>,
     pub texture_slices: u32,
     pub texture_size: u32,
@@ -97,11 +105,28 @@ impl FlatBvh {
             })
             .collect();
 
+        let point_lights: Vec<GpuPointLight> = scene
+            .point_lights
+            .iter()
+            .filter(|l| l.intensity > 0.0)
+            .map(|l| {
+                let inv_range_sq = match l.range {
+                    Some(r) if r > 1e-4 => 1.0 / (r * r),
+                    _ => 0.0,
+                };
+                GpuPointLight {
+                    position_range: [l.position.x, l.position.y, l.position.z, inv_range_sq],
+                    color_intensity: [l.color.x, l.color.y, l.color.z, l.intensity],
+                }
+            })
+            .collect();
+
         eprintln!(
-            "[bvh] Built Flat BVH: {} nodes, {} triangles, {} materials, {} texture slices",
+            "[bvh] Built Flat BVH: {} nodes, {} triangles, {} materials, {} active point lights, {} texture slices",
             nodes.len(),
             ordered_tris.len(),
             materials.len(),
+            point_lights.len(),
             scene.texture_slices
         );
 
@@ -109,6 +134,7 @@ impl FlatBvh {
             nodes,
             triangles: ordered_tris,
             materials,
+            point_lights,
             texture_array: scene.texture_array.clone(),
             texture_slices: scene.texture_slices,
             texture_size: scene.texture_size,

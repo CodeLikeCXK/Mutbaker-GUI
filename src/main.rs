@@ -1,23 +1,26 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
-use bevy::light::{LightProbe, NotShadowCaster};
+use bevy::light::{IrradianceVolume, LightProbe, NotShadowCaster, Skybox};
 use bevy::picking::events::{PointerClick, PointerOut, PointerOver};
 use bevy::prelude::*;
 use bevy::render::error_handler::{RenderErrorHandler, RenderErrorPolicy};
 use bevy::render::render_resource::{
     Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
 };
+use bevy::transform::TransformSystems;
 use glam::UVec3;
 use mutracer_native::baker::{
     bake_irradiance_volume, render_viewport_pt, BakeResult, BakeSettings, ViewportPtSettings,
 };
 use mutracer_native::bvh::FlatBvh;
 use mutracer_native::gpu::GpuContext;
-use mutracer_native::scene::{DirectionalLightData, Scene as NativeScene};
+use mutracer_native::scene::{
+    DirectionalLightData, EnvironmentMap, PointLightData, Scene as NativeScene,
+};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // MuTracer Dark Theme Color Tokens
 const BG_DARK: Color = Color::srgb(0.067, 0.071, 0.078); // #111214
@@ -103,7 +106,14 @@ pub struct AppState {
     pub last_cam_eye: Vec3,
     pub last_cam_center: Vec3,
     pub glb_sun: Option<DirectionalLightData>,
+    pub glb_point_lights: Vec<PointLightData>,
     pub enable_mutbaker_sun: bool,
+    pub env_map: Option<Arc<EnvironmentMap>>,
+    pub env_path: Option<PathBuf>,
+    pub env_enabled: bool,
+    pub env_intensity: f32,
+    pub env_rotation_deg: f32,
+    pub env_cubemap_dirty: bool,
 }
 
 pub struct BakeTask {
@@ -135,6 +145,9 @@ pub struct ViewportPtTask {
     pub sun_dir: Option<Vec3>,
     pub sun_color: Option<Vec3>,
     pub sun_intensity: Option<f32>,
+    pub env_map: Option<Arc<EnvironmentMap>>,
+    pub env_intensity: f32,
+    pub env_rotation_y: f32,
 }
 
 pub struct ViewportPtResult {
@@ -148,6 +161,12 @@ pub struct PathTraceViewportOverlay;
 
 #[derive(Resource)]
 pub struct ImportChannel {
+    pub tx: Sender<PathBuf>,
+    pub rx: Mutex<Receiver<PathBuf>>,
+}
+
+#[derive(Resource)]
+pub struct HdriImportChannel {
     pub tx: Sender<PathBuf>,
     pub rx: Mutex<Receiver<PathBuf>>,
 }
@@ -175,6 +194,12 @@ pub struct OrbitCamera {
 #[derive(Component, Clone)]
 pub enum UiAction {
     ImportExternal,
+    ImportHdri,
+    ToggleHdri,
+    SetHdriIntensity(f32),
+    StepHdriRotation(f32),
+    ResetHdriRotation,
+    ClearHdri,
     SelectScene(usize),
     SetResolution(u32, u32, u32),
     SetSpp(u32),
@@ -200,6 +225,11 @@ pub struct SceneModelRoot;
 
 #[derive(Component)]
 pub struct MainSunLight;
+
+#[derive(Component)]
+pub struct GlbPointLightSynced;
+
+const MAX_POINT_LIGHT_SHADOWS: usize = 4;
 
 fn copy_model_assets(source_file: &Path, dest_folder: &Path) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dest_folder)?;
@@ -310,6 +340,7 @@ fn main() {
     let (bake_task_tx, bake_task_rx) = channel::<BakeTask>();
     let (bake_res_tx, bake_res_rx) = channel::<BakeTaskResult>();
     let (import_tx, import_rx) = channel::<PathBuf>();
+    let (hdri_import_tx, hdri_import_rx) = channel::<PathBuf>();
     let (pt_task_tx, pt_task_rx) = channel::<ViewportPtTask>();
     let (pt_res_tx, pt_res_rx) = channel::<ViewportPtResult>();
 
@@ -391,6 +422,9 @@ fn main() {
                     sun_dir: latest_task.sun_dir.or(cached_sun_dir),
                     sun_color: latest_task.sun_color.or(cached_sun_color),
                     sun_intensity: latest_task.sun_intensity.or(cached_sun_intensity),
+                    env_map: latest_task.env_map,
+                    env_intensity: latest_task.env_intensity,
+                    env_rotation_y: latest_task.env_rotation_y,
                 };
 
                 match render_viewport_pt(&gpu, bvh, &settings) {
@@ -455,6 +489,10 @@ fn main() {
             tx: import_tx,
             rx: Mutex::new(import_rx),
         })
+        .insert_resource(HdriImportChannel {
+            tx: hdri_import_tx,
+            rx: Mutex::new(hdri_import_rx),
+        })
         .insert_resource(AppState {
             scene_name: default_scene.display_name.to_string(),
             scene_path: default_scene.asset_path.to_string(),
@@ -482,7 +520,14 @@ fn main() {
             last_cam_eye: Vec3::ZERO,
             last_cam_center: Vec3::ZERO,
             glb_sun: None,
+            glb_point_lights: Vec::new(),
             enable_mutbaker_sun: false, // Mutbaker自身光源默认关闭
+            env_map: None,
+            env_path: None,
+            env_enabled: false,
+            env_intensity: 1.0,
+            env_rotation_deg: 0.0,
+            env_cubemap_dirty: false,
         })
         .add_systems(Startup, setup)
         .add_systems(
@@ -496,12 +541,18 @@ fn main() {
                 sync_probe_spheres,
                 draw_probe_gizmos,
                 sync_baked_irradiance_volume,
+                sync_bevy_hdri_skybox,
                 update_button_highlights,
                 poll_bake_results,
                 poll_import_dialog,
+                poll_hdri_import_dialog,
                 update_labels,
                 cleanup_gltf_duplicate_lights,
             ),
+        )
+        .add_systems(
+            PostUpdate,
+            sync_gltf_point_lights.after(TransformSystems::Propagate),
         )
         .add_observer(handle_ui_click)
         .add_observer(handle_button_over)
@@ -521,6 +572,94 @@ fn cleanup_gltf_duplicate_lights(
 ) {
     for e in &lights {
         commands.entity(e).despawn();
+    }
+}
+
+/// Align glTF-spawned Bevy `PointLight` entities with `visual_scale`, exposure, range, and shadow settings.
+fn sync_gltf_point_lights(
+    mut commands: Commands,
+    state: Res<AppState>,
+    existing_synced: Query<&PointLight, With<GlbPointLightSynced>>,
+    mut pending_lights: Query<
+        (Entity, &mut PointLight, &GlobalTransform, &mut Visibility),
+        Without<GlbPointLightSynced>,
+    >,
+) {
+    if pending_lights.is_empty() {
+        return;
+    }
+
+    let visual_scale = if state.visual_scale.abs() > 1e-6 {
+        state.visual_scale
+    } else {
+        1.0
+    };
+    let v_diag = ((state.bounds_max - state.bounds_min) * visual_scale)
+        .length()
+        .max(5.0);
+
+    let mut active_shadows = existing_synced
+        .iter()
+        .filter(|l| l.shadow_maps_enabled)
+        .count();
+
+    for (entity, mut light, global_tf, mut vis) in &mut pending_lights {
+        let world_pos = global_tf.translation();
+        let matched = state
+            .glb_point_lights
+            .iter()
+            .min_by(|a, b| {
+                let da = (a.position * visual_scale).distance_squared(world_pos);
+                let db = (b.position * visual_scale).distance_squared(world_pos);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .filter(|pt| {
+                let max_tol = (v_diag * 0.05).max(0.25);
+                (pt.position * visual_scale).distance_squared(world_pos) <= max_tol * max_tol
+            });
+
+        let raw_intensity = matched
+            .map(|pt| pt.intensity)
+            .unwrap_or_else(|| light.intensity / (4.0 * std::f32::consts::PI));
+
+        if raw_intensity <= 0.0 {
+            *vis = Visibility::Hidden;
+            light.intensity = 0.0;
+            light.shadow_maps_enabled = false;
+            commands.entity(entity).insert(GlbPointLightSynced);
+            continue;
+        }
+
+        // Align range: unbounded glTF point lights default to 20.0 in bevy_gltf; expand to cover visual bounds.
+        light.range = match matched.and_then(|pt| pt.range) {
+            Some(r) if r > 0.0 => (r * visual_scale).max(0.05),
+            _ => (v_diag * 2.0).max(50.0),
+        };
+
+        // Compensate inverse-square distance attenuation for visual_scale, and calibrate
+        // standard candela values to Bevy's default EV100 exposure (matching ~600x ambient/GI scale).
+        let effective_cd = if raw_intensity <= 1000.0 {
+            raw_intensity * 600.0
+        } else {
+            1000.0 * 600.0 + (raw_intensity - 1000.0)
+        };
+        light.intensity = effective_cd * 4.0 * std::f32::consts::PI * visual_scale * visual_scale;
+
+        if active_shadows < MAX_POINT_LIGHT_SHADOWS {
+            light.shadow_maps_enabled = true;
+            light.shadow_map_near_z = (0.05 * visual_scale.max(0.01)).clamp(0.01, 0.25);
+            light.shadow_depth_bias = 0.02;
+            light.shadow_normal_bias = 0.6;
+            active_shadows += 1;
+        } else {
+            light.shadow_maps_enabled = false;
+        }
+
+        eprintln!(
+            "[mutbaker] Synced glTF PointLight at {:?}: range={:.2}, intensity={:.1} lm, shadows={}",
+            world_pos, light.range, light.intensity, light.shadow_maps_enabled
+        );
+        commands.entity(entity).insert(GlbPointLightSynced);
     }
 }
 
@@ -647,6 +786,13 @@ fn setup(
         mesh: probe_mesh,
         material: probe_mat,
     });
+
+    // Parse initial scene lights so AppState reflects any GLB sun or point lights from startup
+    let full_init_path = resolve_scene_path(sc.asset_path);
+    if let Ok(native_scene) = NativeScene::load_gltf(&full_init_path) {
+        state.glb_sun = native_scene.directional_light;
+        state.glb_point_lights = native_scene.point_lights;
+    }
 
     // Spawn Initial Scene Model
     spawn_scene_model(&mut commands, &assets, sc.asset_path, sc.visual_scale, state.use_baked_raster);
@@ -834,6 +980,43 @@ fn build_ui(commands: &mut Commands) {
                         "Mutbaker Sun: OFF",
                         UiAction::ToggleSun,
                     );
+
+                    panel_section_header(panel, "ENVIRONMENT (HDRI)");
+                    action_button(panel, "+ IMPORT HDRI (.hdr)...", UiAction::ImportHdri);
+                    panel_button(panel, "HDRI: None", UiAction::ToggleHdri);
+
+                    panel
+                        .spawn((
+                            Node {
+                                width: Val::Percent(100.0),
+                                flex_direction: FlexDirection::Row,
+                                justify_content: JustifyContent::SpaceBetween,
+                                margin: UiRect::bottom(Val::Px(4.0)),
+                                ..default()
+                            },
+                            Pickable::IGNORE,
+                        ))
+                        .with_children(|row| {
+                            panel_sub_button(row, "0.5x", UiAction::SetHdriIntensity(0.5));
+                            panel_sub_button(row, "1.0x", UiAction::SetHdriIntensity(1.0));
+                            panel_sub_button(row, "2.0x", UiAction::SetHdriIntensity(2.0));
+                        });
+
+                    panel
+                        .spawn((
+                            Node {
+                                width: Val::Percent(100.0),
+                                flex_direction: FlexDirection::Row,
+                                justify_content: JustifyContent::SpaceBetween,
+                                ..default()
+                            },
+                            Pickable::IGNORE,
+                        ))
+                        .with_children(|row| {
+                            panel_sub_button(row, "+45 Deg", UiAction::StepHdriRotation(45.0));
+                            panel_sub_button(row, "0 Deg", UiAction::ResetHdriRotation);
+                            panel_sub_button(row, "Clear", UiAction::ClearHdri);
+                        });
                 });
             });
         });
@@ -985,6 +1168,10 @@ fn is_action_selected(action: &UiAction, state: &AppState) -> bool {
         UiAction::ToggleProbeGrid => state.show_probe_grid,
         UiAction::ToggleBakedRaster => state.use_baked_raster,
         UiAction::ToggleSun => state.glb_sun.is_some() || state.enable_mutbaker_sun,
+        UiAction::ToggleHdri => state.env_enabled && state.env_map.is_some(),
+        UiAction::SetHdriIntensity(v) => {
+            state.env_map.is_some() && (state.env_intensity - *v).abs() < 1e-3
+        }
         _ => false,
     }
 }
@@ -1058,6 +1245,7 @@ fn handle_ui_click(
     mut commands: Commands,
     assets: Res<AssetServer>,
     import_channel: Res<ImportChannel>,
+    hdri_import_channel: Res<HdriImportChannel>,
     mut state: ResMut<AppState>,
     scene_model_query: Query<Entity, With<SceneModelRoot>>,
     mut cam_query: Query<(&mut Transform, &mut OrbitCamera), (Without<SceneModelRoot>, Without<MainSunLight>)>,
@@ -1088,6 +1276,81 @@ fn handle_ui_click(
                 }
             });
         }
+        UiAction::ImportHdri => {
+            state.status_text = "Opening File Dialog... Please select a .hdr HDRI file".into();
+            let tx = hdri_import_channel.tx.clone();
+            std::thread::spawn(move || {
+                let ps_script = "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::EnableVisualStyles(); $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Filter = 'Radiance HDR (*.hdr)|*.hdr|All files (*.*)|*.*'; $f.Title = 'Select Equirectangular HDRI (.hdr)'; if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.FileName }";
+                let output = std::process::Command::new("powershell")
+                    .args(["-NoProfile", "-Command", ps_script])
+                    .output();
+                if let Ok(out) = output {
+                    let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !path_str.is_empty() {
+                        let path = PathBuf::from(path_str);
+                        if path.exists() {
+                            let _ = tx.send(path);
+                        }
+                    }
+                }
+            });
+        }
+        UiAction::ToggleHdri => {
+            if state.env_map.is_some() {
+                state.env_enabled = !state.env_enabled;
+                state.env_cubemap_dirty = true;
+                state.pt_pending = false;
+                state.pt_accum_frames = 0;
+                state.last_cam_eye = Vec3::ZERO;
+                state.status_text = format!(
+                    "HDRI Environment: {}",
+                    if state.env_enabled { "ON" } else { "OFF" }
+                );
+            } else {
+                state.status_text = "No HDRI loaded. Click + IMPORT HDRI (.hdr) first.".into();
+            }
+        }
+        UiAction::SetHdriIntensity(val) => {
+            state.env_intensity = val;
+            if state.env_map.is_some() {
+                state.env_enabled = true;
+                state.env_cubemap_dirty = true;
+                state.pt_pending = false;
+                state.pt_accum_frames = 0;
+                state.last_cam_eye = Vec3::ZERO;
+            }
+            state.status_text = format!("HDRI Intensity: {:.2}x", val);
+        }
+        UiAction::StepHdriRotation(delta_deg) => {
+            state.env_rotation_deg = (state.env_rotation_deg + delta_deg).rem_euclid(360.0);
+            if state.env_map.is_some() {
+                state.env_cubemap_dirty = true;
+                state.pt_pending = false;
+                state.pt_accum_frames = 0;
+                state.last_cam_eye = Vec3::ZERO;
+            }
+            state.status_text = format!("HDRI Rotation: {:.0} deg", state.env_rotation_deg);
+        }
+        UiAction::ResetHdriRotation => {
+            state.env_rotation_deg = 0.0;
+            if state.env_map.is_some() {
+                state.env_cubemap_dirty = true;
+                state.pt_pending = false;
+                state.pt_accum_frames = 0;
+                state.last_cam_eye = Vec3::ZERO;
+            }
+            state.status_text = "HDRI Rotation: 0 deg".into();
+        }
+        UiAction::ClearHdri => {
+            state.env_map = None;
+            state.env_path = None;
+            state.env_enabled = false;
+            state.env_cubemap_dirty = true;
+            state.pt_pending = false;
+            state.pt_accum_frames = 0;
+            state.last_cam_eye = Vec3::ZERO;
+            state.status_text = "HDRI cleared (using fallback sky)".into();
+        }
         UiAction::SelectScene(idx) => {
             let sc = &SCENES[idx];
             state.scene_name = sc.display_name.to_string();
@@ -1111,6 +1374,7 @@ fn handle_ui_click(
 
             // Update persistent BakedIrradianceVolume transform
             if let Ok(vol_entity) = volume_query.single() {
+                commands.entity(vol_entity).remove::<IrradianceVolume>();
                 let center = (sc.bounds_min + sc.bounds_max) * 0.5 * sc.visual_scale;
                 let size = (sc.bounds_max - sc.bounds_min) * sc.visual_scale;
                 commands.entity(vol_entity).insert((
@@ -1137,10 +1401,14 @@ fn handle_ui_click(
                 transform.look_at(cam.center, Vec3::Y);
             }
 
-            // Load glTF sunlight if available for preset scene
+            // Load glTF lights if available for preset scene
             let full_scene_path = resolve_scene_path(sc.asset_path);
             let native_scene = NativeScene::load_gltf(&full_scene_path).ok();
             state.glb_sun = native_scene.as_ref().and_then(|s| s.directional_light.clone());
+            state.glb_point_lights = native_scene
+                .as_ref()
+                .map(|s| s.point_lights.clone())
+                .unwrap_or_default();
 
             let v_center = sc.cam_center;
             let v_size = (sc.bounds_max - sc.bounds_min) * sc.visual_scale;
@@ -1152,7 +1420,16 @@ fn handle_ui_click(
                 &mut dir_light_query,
             );
 
-            state.status_text = format!("Loaded: {}", sc.display_name);
+            let active_pts = state
+                .glb_point_lights
+                .iter()
+                .filter(|l| l.intensity > 0.0)
+                .count();
+            state.status_text = if active_pts > 0 {
+                format!("Loaded: {} | Point Lights: {}", sc.display_name, active_pts)
+            } else {
+                format!("Loaded: {}", sc.display_name)
+            };
         }
         UiAction::SetResolution(x, y, z) => {
             state.resolution = UVec3::new(x, y, z);
@@ -1229,6 +1506,12 @@ fn handle_ui_click(
                     (None, None, None)
                 };
 
+                let env_map = if state.env_enabled {
+                    state.env_map.clone()
+                } else {
+                    None
+                };
+
                 let task = BakeTask {
                     scene_path: full_scene_path,
                     settings: BakeSettings {
@@ -1240,6 +1523,9 @@ fn handle_ui_click(
                         sun_dir,
                         sun_color,
                         sun_intensity,
+                        env_map,
+                        env_intensity: state.env_intensity,
+                        env_rotation_y: state.env_rotation_deg.to_radians(),
                     },
                 };
                 let _ = state.bake_tx.send(task);
@@ -1279,6 +1565,19 @@ fn handle_ui_click(
                 let out_ktx2 = PathBuf::from(&out_ktx2_name);
                 let out_meta = PathBuf::from(&out_meta_name);
                 if let Ok(_) = std::fs::write(&out_ktx2, &res.ktx2_bytes) {
+                    let hdri_meta = if state.env_enabled {
+                        state.env_map.as_ref().map(|e| {
+                            serde_json::json!({
+                                "name": e.name,
+                                "width": e.width,
+                                "height": e.height,
+                                "intensity": state.env_intensity,
+                                "rotation_deg": state.env_rotation_deg,
+                            })
+                        })
+                    } else {
+                        None
+                    };
                     let meta = serde_json::json!({
                         "voxels_texture": out_ktx2_name,
                         "format": "VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 (Rgb9e5Ufloat)",
@@ -1287,6 +1586,7 @@ fn handle_ui_click(
                         "bounds_min": [state.bounds_min.x, state.bounds_min.y, state.bounds_min.z],
                         "bounds_max": [state.bounds_max.x, state.bounds_max.y, state.bounds_max.z],
                         "scene": state.scene_name,
+                        "hdri": hdri_meta,
                     });
                     let _ = std::fs::write(
                         &out_meta,
@@ -1407,6 +1707,7 @@ fn poll_import_dialog(
 
             // Update persistent BakedIrradianceVolume transform
             if let Ok(vol_entity) = volume_query.single() {
+                commands.entity(vol_entity).remove::<IrradianceVolume>();
                 commands.entity(vol_entity).insert((
                     Transform::from_translation(v_center).with_scale(safe_v_size * 1.15),
                     LightProbe {
@@ -1432,8 +1733,9 @@ fn poll_import_dialog(
                 transform.look_at(cam.center, Vec3::Y);
             }
 
-            // Apply glTF sunlight from imported model or keep Mutbaker sun off by default
+            // Apply glTF lights from imported model or keep Mutbaker sun off by default
             state.glb_sun = native_scene.directional_light.clone();
+            state.glb_point_lights = native_scene.point_lights.clone();
             apply_scene_sunlight(
                 state.glb_sun.as_ref(),
                 state.enable_mutbaker_sun,
@@ -1447,14 +1749,112 @@ fn poll_import_dialog(
             } else {
                 "Sun: None (Mutbaker Sun OFF)".to_string()
             };
+            let active_pts = state
+                .glb_point_lights
+                .iter()
+                .filter(|l| l.intensity > 0.0)
+                .count();
 
             state.status_text = format!(
-                "Imported: {} ({} Tris) | {}",
-                file_name, state.triangle_count, sun_status
+                "Imported: {} ({} Tris) | {} | Point Lights: {}",
+                file_name, state.triangle_count, sun_status, active_pts
             );
         } else {
             state.status_text = format!("Failed to parse glTF: {}", file_name);
         }
+    }
+}
+
+fn poll_hdri_import_dialog(
+    hdri_channel: Res<HdriImportChannel>,
+    mut state: ResMut<AppState>,
+) {
+    let maybe_path = {
+        if let Ok(rx) = hdri_channel.rx.lock() {
+            rx.try_recv().ok()
+        } else {
+            None
+        }
+    };
+
+    if let Some(path) = maybe_path {
+        let file_name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "environment.hdr".to_string());
+
+        match EnvironmentMap::load_hdr(&path) {
+            Ok(env) => {
+                let dims = (env.width, env.height);
+                state.env_map = Some(Arc::new(env));
+                state.env_path = Some(path);
+                state.env_enabled = true;
+                state.env_cubemap_dirty = true;
+                state.pt_pending = false;
+                state.pt_accum_frames = 0;
+                state.last_cam_eye = Vec3::ZERO;
+                state.status_text = format!(
+                    "Loaded HDRI: {} ({}x{}, {:.2}x)",
+                    file_name, dims.0, dims.1, state.env_intensity
+                );
+            }
+            Err(e) => {
+                state.status_text = format!("Failed to load HDRI {}: {e:#}", file_name);
+            }
+        }
+    }
+}
+
+fn sync_bevy_hdri_skybox(
+    mut commands: Commands,
+    mut state: ResMut<AppState>,
+    mut images: ResMut<Assets<Image>>,
+    cam_query: Query<(Entity, Option<&Skybox>), With<OrbitCamera>>,
+) {
+    if !state.env_cubemap_dirty {
+        return;
+    }
+    state.env_cubemap_dirty = false;
+
+    let Ok((cam_entity, existing_skybox)) = cam_query.single() else {
+        return;
+    };
+
+    if state.env_enabled {
+        if let Some(ref env) = state.env_map {
+            let face_size = 128u32;
+            let cube_bytes = env.to_cubemap_rgba16f(
+                face_size,
+                state.env_intensity,
+                state.env_rotation_deg.to_radians(),
+            );
+            let mut cube_img = Image::new(
+                Extent3d {
+                    width: face_size,
+                    height: face_size,
+                    depth_or_array_layers: 6,
+                },
+                TextureDimension::D2,
+                cube_bytes,
+                TextureFormat::Rgba16Float,
+                RenderAssetUsages::RENDER_WORLD,
+            );
+            cube_img.texture_view_descriptor = Some(TextureViewDescriptor {
+                dimension: Some(TextureViewDimension::Cube),
+                ..default()
+            });
+            let cube_handle = images.add(cube_img);
+            commands.entity(cam_entity).insert(Skybox {
+                image: Some(cube_handle),
+                brightness: 1000.0,
+                rotation: Quat::IDENTITY,
+            });
+            return;
+        }
+    }
+
+    if existing_skybox.is_some() {
+        commands.entity(cam_entity).remove::<Skybox>();
     }
 }
 
@@ -1502,11 +1902,29 @@ fn update_button_highlights(
                 }
             }
         }
+        if matches!(action, UiAction::ToggleHdri) {
+            for child in children.iter() {
+                if let Ok(mut text) = text_content_query.get_mut(child) {
+                    text.0 = if let Some(ref env) = state.env_map {
+                        if state.env_enabled {
+                            format!("HDRI: ON ({})", env.name)
+                        } else {
+                            format!("HDRI: OFF ({})", env.name)
+                        }
+                    } else {
+                        "HDRI: None".into()
+                    };
+                }
+            }
+        }
 
-        // Keep action buttons (START GPU BAKE, EXPORT KTX2, IMPORT GLTF) with distinct accent styling
+        // Keep action buttons (START GPU BAKE, EXPORT KTX2, IMPORT GLTF, IMPORT HDRI) with distinct accent styling
         if matches!(
             action,
-            UiAction::StartBake | UiAction::ExportOutput | UiAction::ImportExternal
+            UiAction::StartBake
+                | UiAction::ExportOutput
+                | UiAction::ImportExternal
+                | UiAction::ImportHdri
         ) {
             continue;
         }
@@ -1679,6 +2097,12 @@ fn dispatch_viewport_pt_system(
         None
     };
 
+    let env_map = if state.env_enabled {
+        state.env_map.clone()
+    } else {
+        None
+    };
+
     let task = ViewportPtTask {
         scene_path: full_scene_path,
         eye,
@@ -1698,6 +2122,9 @@ fn dispatch_viewport_pt_system(
         sun_dir,
         sun_color,
         sun_intensity,
+        env_map,
+        env_intensity: state.env_intensity,
+        env_rotation_y: state.env_rotation_deg.to_radians(),
     };
 
     if state.pt_task_tx.send(task).is_ok() {
@@ -1881,11 +2308,33 @@ fn draw_probe_gizmos(mut gizmos: Gizmos, state: Res<AppState>) {
         return;
     }
 
+    let max_extent = v_size.x.max(v_size.y).max(v_size.z);
+    let radius = (max_extent / 45.0).clamp(0.04, 0.35);
+
+    // Draw active GLB point light markers for spatial alignment inspection
+    let light_marker_size = (radius * 1.4).clamp(0.08, 0.45);
+    for pt in &state.glb_point_lights {
+        if pt.intensity <= 0.0 {
+            continue;
+        }
+        let lp = pt.position * visual_scale;
+        let c = Color::srgb(
+            pt.color.x.clamp(0.2, 1.0),
+            pt.color.y.clamp(0.2, 1.0),
+            pt.color.z.clamp(0.2, 1.0),
+        );
+        gizmos.cube(
+            Transform::from_translation(lp).with_scale(Vec3::splat(light_marker_size)),
+            c,
+        );
+        gizmos.line(lp - Vec3::X * light_marker_size, lp + Vec3::X * light_marker_size, c);
+        gizmos.line(lp - Vec3::Y * light_marker_size, lp + Vec3::Y * light_marker_size, c);
+        gizmos.line(lp - Vec3::Z * light_marker_size, lp + Vec3::Z * light_marker_size, c);
+    }
+
     let rx = state.resolution.x;
     let ry = state.resolution.y;
     let rz = state.resolution.z;
-    let max_extent = v_size.x.max(v_size.y).max(v_size.z);
-    let radius = (max_extent / 45.0).clamp(0.04, 0.35);
 
     let tex_w = rx;
     let tex_h = 2 * ry;
@@ -1985,7 +2434,7 @@ fn sync_baked_irradiance_volume(
                     (avg_b / max_c * 0.7 + 0.3).clamp(0.0, 1.0),
                 );
                 ambient_light.color = col;
-                ambient_light.brightness = (max_c * 600.0).clamp(120.0, 1500.0);
+                ambient_light.brightness = (max_c * 80.0).clamp(20.0, 150.0);
                 return;
             }
         }
@@ -1998,8 +2447,10 @@ fn sync_baked_irradiance_volume(
 }
 
 fn poll_bake_results(
+    mut commands: Commands,
     mut state: ResMut<AppState>,
     mut images: ResMut<Assets<Image>>,
+    volume_query: Query<Entity, With<BakedIrradianceVolume>>,
 ) {
     let maybe_res = {
         if let Ok(rx) = state.bake_rx.lock() {
@@ -2071,6 +2522,14 @@ fn poll_bake_results(
                     }
                 };
 
+                if let Ok(vol_entity) = volume_query.single() {
+                    commands.entity(vol_entity).insert(IrradianceVolume {
+                        voxels: handle.clone(),
+                        intensity: 600.0,
+                        affects_lightmapped_meshes: true,
+                    });
+                }
+
                 state.baked_image_handle = Some(handle);
                 state.baked_result = Some(b);
                 state.gpu_ready_frames = 0;
@@ -2086,6 +2545,7 @@ fn poll_bake_results(
 
 fn update_labels(
     state: Res<AppState>,
+    synced_pts: Query<&PointLight, With<GlbPointLightSynced>>,
     mut status_query: Query<&mut Text, (With<StatusLabel>, Without<InfoLabel>)>,
     mut info_query: Query<&mut Text, (With<InfoLabel>, Without<StatusLabel>)>,
 ) {
@@ -2113,10 +2573,45 @@ fn update_labels(
         } else {
             "OFF (Default)".to_string()
         };
+        let active_pts = state
+            .glb_point_lights
+            .iter()
+            .filter(|l| l.intensity > 0.0)
+            .count();
+        let total_pts = state.glb_point_lights.len();
+        let point_lights_desc = if total_pts == 0 {
+            "None".to_string()
+        } else if active_pts == 0 {
+            format!("0 Active ({} disabled in GLB)", total_pts)
+        } else if state.use_baked_raster && !synced_pts.is_empty() {
+            let shadow_pts = synced_pts
+                .iter()
+                .filter(|l| l.shadow_maps_enabled)
+                .count();
+            format!(
+                "{} Active (Shadows: {}/{})",
+                active_pts, shadow_pts, active_pts
+            )
+        } else if total_pts > active_pts {
+            format!("{} Active / {} Total (GLB)", active_pts, total_pts)
+        } else {
+            format!("{} Active (GLB)", active_pts)
+        };
+        let hdri_desc = if let Some(ref env) = state.env_map {
+            let tag = if state.env_enabled { "ON" } else { "OFF" };
+            format!(
+                "{} [{}] ({:.2}x, {:.0} deg)",
+                env.name, tag, state.env_intensity, state.env_rotation_deg
+            )
+        } else {
+            "None (Fallback Sky)".to_string()
+        };
         text.0 = format!(
-            "Model: {}\nSun: {}\nViewport: {}\nBaker: {}\nGrid: {}x{}x{} ({} Probes)\nSPP: {} | Bounces: {}",
+            "Model: {}\nHDRI: {}\nSun: {}\nPoint Lights: {}\nViewport: {}\nBaker: {}\nGrid: {}x{}x{} ({} Probes)\nSPP: {} | Bounces: {}",
             state.scene_name,
+            hdri_desc,
             sun_desc,
+            point_lights_desc,
             viewport_desc,
             baker_desc,
             state.resolution.x,

@@ -3,9 +3,10 @@ use glam::{UVec3, Vec3};
 use mutracer_native::baker::{bake_irradiance_volume, BakeSettings};
 use mutracer_native::bvh::FlatBvh;
 use mutracer_native::gpu::GpuContext;
-use mutracer_native::scene::Scene;
+use mutracer_native::scene::{EnvironmentMap, Scene};
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn print_usage() {
     eprintln!(
@@ -23,6 +24,9 @@ Bake Options:
   --spp <samples>             Samples per ambient cube face (default: 64)
   --bounces <count>           Max diffuse bounces (default: 2)
   --bounds <minX,minY,minZ,maxX,maxY,maxZ> Custom bounding box (default: scene AABB)
+  --hdri <path.hdr>           Optional equirectangular HDRI environment map
+  --hdri-intensity <val>      HDRI intensity multiplier (default: 1.0)
+  --hdri-rotation <deg>       HDRI yaw rotation around Y axis in degrees (default: 0.0)
 "#
     );
 }
@@ -68,6 +72,9 @@ fn run_bake(args: &[String]) -> Result<()> {
     let mut custom_sun_dir: Option<Vec3> = None;
     let mut custom_sun_color: Option<Vec3> = None;
     let mut custom_sun_intensity: Option<f32> = None;
+    let mut hdri_path: Option<PathBuf> = None;
+    let mut hdri_intensity: f32 = 1.0;
+    let mut hdri_rotation_deg: f32 = 0.0;
 
     let mut i = 0;
     while i < args.len() {
@@ -159,6 +166,28 @@ fn run_bake(args: &[String]) -> Result<()> {
                     }
                 }
             }
+            "--hdri" => {
+                i += 1;
+                if i < args.len() {
+                    hdri_path = Some(PathBuf::from(&args[i]));
+                }
+            }
+            "--hdri-intensity" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(v) = args[i].parse() {
+                        hdri_intensity = v;
+                    }
+                }
+            }
+            "--hdri-rotation" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(v) = args[i].parse() {
+                        hdri_rotation_deg = v;
+                    }
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -190,6 +219,11 @@ fn run_bake(args: &[String]) -> Result<()> {
         (custom_sun_dir, custom_sun_color, custom_sun_intensity)
     };
 
+    let env_map = match hdri_path {
+        Some(ref p) => Some(Arc::new(EnvironmentMap::load_hdr(p)?)),
+        None => None,
+    };
+
     let settings = BakeSettings {
         resolution,
         bounds_min: b_min,
@@ -199,6 +233,9 @@ fn run_bake(args: &[String]) -> Result<()> {
         sun_dir,
         sun_color,
         sun_intensity,
+        env_map,
+        env_intensity: hdri_intensity,
+        env_rotation_y: hdri_rotation_deg.to_radians(),
     };
 
     let result = bake_irradiance_volume(&gpu, &bvh, &settings)?;

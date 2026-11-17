@@ -1,9 +1,11 @@
-use crate::bvh::FlatBvh;
+use crate::bvh::{FlatBvh, GpuPointLight};
 use crate::gpu::GpuContext;
 use crate::ktx2_writer::{create_ktx2_3d_rgb9e5, pack_rgb9e5};
+use crate::scene::EnvironmentMap;
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use glam::{UVec3, Vec3};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[repr(C)]
@@ -12,9 +14,11 @@ pub struct BakeUniforms {
     pub bounds_min: [f32; 4],
     pub bounds_max: [f32; 4],
     pub resolution: [u32; 4], // rx, ry, rz, spp
-    pub params: [u32; 4],     // max_bounces, rng_seed, total_voxels, pad
+    pub params: [u32; 4],     // max_bounces, rng_seed, total_voxels, point_light_count
     pub sun_dir: [f32; 4],    // xyz = sun direction, w = enabled flag (1.0 or 0.0)
     pub sun_color: [f32; 4],  // rgb = sun color, w = intensity
+    pub env_params: [f32; 4], // x = enabled (1/0), y = intensity, z = rotation_y_rad, w = has_cdf (1/0)
+    pub env_dims: [u32; 4],   // cdf_width, cdf_height, tex_width, tex_height
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +31,9 @@ pub struct BakeSettings {
     pub sun_dir: Option<Vec3>,
     pub sun_color: Option<Vec3>,
     pub sun_intensity: Option<f32>,
+    pub env_map: Option<Arc<EnvironmentMap>>,
+    pub env_intensity: f32,
+    pub env_rotation_y: f32,
 }
 
 pub struct BakeResult {
@@ -44,9 +51,11 @@ struct BakeUniforms {
     bounds_min: vec4f,
     bounds_max: vec4f,
     resolution: vec4u, // rx, ry, rz, spp
-    params: vec4u,     // max_bounces, rng_seed, total_voxels, pad
+    params: vec4u,     // max_bounces, rng_seed, total_voxels, point_light_count
     sun_dir: vec4f,    // xyz = sun direction, w = enabled flag (1.0 or 0.0)
     sun_color: vec4f,  // rgb = sun color, w = intensity
+    env_params: vec4f, // x = enabled (1/0), y = intensity, z = rotation_y_rad, w = has_cdf (1/0)
+    env_dims: vec4u,   // cdf_width, cdf_height, tex_width, tex_height
 };
 
 struct GpuBvhNode {
@@ -82,6 +91,11 @@ struct GpuMaterial {
     tex_index: vec4i,
 };
 
+struct GpuPointLight {
+    position_range: vec4f,  // xyz = world position, w = inverse_range_squared (0.0 if unbounded)
+    color_intensity: vec4f, // rgb = linear color, w = intensity (candela)
+};
+
 @group(0) @binding(0) var<uniform> u: BakeUniforms;
 @group(0) @binding(1) var<storage, read> bvh_nodes: array<GpuBvhNode>;
 @group(0) @binding(2) var<storage, read> triangles: array<GpuTriangle>;
@@ -89,6 +103,96 @@ struct GpuMaterial {
 @group(0) @binding(4) var<storage, read_write> out_irradiance: array<vec4f>;
 @group(0) @binding(5) var tex_array: texture_2d_array<f32>;
 @group(0) @binding(6) var tex_sampler: sampler;
+@group(0) @binding(7) var<storage, read> point_lights: array<GpuPointLight>;
+@group(0) @binding(8) var env_tex: texture_2d<f32>;
+@group(0) @binding(9) var env_sampler: sampler;
+@group(0) @binding(10) var<storage, read> env_cdf: array<f32>;
+
+const PI: f32 = 3.14159265359;
+const INV_PI: f32 = 0.31830988618;
+const TWO_PI: f32 = 6.28318530718;
+
+fn rotate_y(v: vec3f, angle: f32) -> vec3f {
+    if (abs(angle) < 1e-6) { return v; }
+    let s = sin(angle);
+    let c = cos(angle);
+    return vec3f(v.x * c + v.z * s, v.y, -v.x * s + v.z * c);
+}
+
+fn sample_hdri(world_dir: vec3f) -> vec3f {
+    let d = normalize(rotate_y(world_dir, -u.env_params.z));
+    let u_coord = atan2(d.z, d.x) / TWO_PI + 0.5;
+    let v_coord = acos(clamp(d.y, -1.0, 1.0)) * INV_PI;
+    return textureSampleLevel(env_tex, env_sampler, vec2f(u_coord, v_coord), 0.0).rgb * u.env_params.y;
+}
+
+fn hdri_pdf(world_dir: vec3f) -> f32 {
+    if (u.env_params.w < 0.5) {
+        return 0.0;
+    }
+    let cw = u.env_dims.x;
+    let ch = u.env_dims.y;
+    if (cw == 0u || ch == 0u) { return 0.0; }
+    let d = normalize(rotate_y(world_dir, -u.env_params.z));
+    let u_coord = fract(atan2(d.z, d.x) / TWO_PI + 0.5);
+    let v_coord = clamp(acos(clamp(d.y, -1.0, 1.0)) * INV_PI, 0.0, 0.999999);
+
+    let x = min(u32(floor(u_coord * f32(cw))), cw - 1u);
+    let y = min(u32(floor(v_coord * f32(ch))), ch - 1u);
+
+    let p_row = max(0.0, env_cdf[y + 1u] - env_cdf[y]);
+    let cond_base = (ch + 1u) + y * (cw + 1u);
+    let p_col = max(0.0, env_cdf[cond_base + x + 1u] - env_cdf[cond_base + x]);
+    let sin_theta = max(sqrt(max(1.0 - d.y * d.y, 0.0)), 1e-5);
+    return (p_row * p_col * f32(cw * ch)) / (2.0 * PI * PI * sin_theta);
+}
+
+fn sample_hdri_importance(u1: f32, u2: f32) -> vec4f {
+    let cw = u.env_dims.x;
+    let ch = u.env_dims.y;
+    var lo = 0u;
+    var hi = ch;
+    while (lo + 1u < hi) {
+        let mid = (lo + hi) >> 1u;
+        if (env_cdf[mid] <= u1) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let y = lo;
+    let m0 = env_cdf[y];
+    let m1 = env_cdf[y + 1u];
+    let p_row = max(0.0, m1 - m0);
+    let dy = clamp((u1 - m0) / max(p_row, 1e-8), 0.0, 0.999999);
+    let v_coord = (f32(y) + dy) / f32(ch);
+
+    let cond_base = (ch + 1u) + y * (cw + 1u);
+    var clo = 0u;
+    var chi = cw;
+    while (clo + 1u < chi) {
+        let mid = (clo + chi) >> 1u;
+        if (env_cdf[cond_base + mid] <= u2) {
+            clo = mid;
+        } else {
+            chi = mid;
+        }
+    }
+    let x = clo;
+    let c0 = env_cdf[cond_base + x];
+    let c1 = env_cdf[cond_base + x + 1u];
+    let p_col = max(0.0, c1 - c0);
+    let dx = clamp((u2 - c0) / max(p_col, 1e-8), 0.0, 0.999999);
+    let u_coord = (f32(x) + dx) / f32(cw);
+
+    let phi = (u_coord - 0.5) * TWO_PI;
+    let theta = v_coord * PI;
+    let sin_theta = sin(theta);
+    let env_dir = vec3f(sin_theta * cos(phi), cos(theta), sin_theta * sin(phi));
+    let world_dir = normalize(rotate_y(env_dir, u.env_params.z));
+    let pdf_omega = (p_row * p_col * f32(cw * ch)) / (2.0 * PI * PI * max(sin_theta, 1e-5));
+    return vec4f(world_dir, pdf_omega);
+}
 
 struct HitRecord {
     t: f32,
@@ -184,6 +288,49 @@ fn rand_f32(seed: ptr<function, u32>) -> f32 {
     return f32(*seed) / 4294967295.0;
 }
 
+fn point_light_attenuation(dist_sq: f32, inv_range_sq: f32) -> f32 {
+    var range_falloff = 1.0;
+    if (inv_range_sq > 0.0) {
+        let factor = dist_sq * inv_range_sq;
+        if (factor >= 1.0) {
+            return 0.0;
+        }
+        let smooth_factor = clamp(1.0 - factor * factor, 0.0, 1.0);
+        range_falloff = smooth_factor * smooth_factor;
+    }
+    return range_falloff / max(dist_sq, 0.0001);
+}
+
+fn eval_point_lights(hit_p: vec3f, hit_n: vec3f, eps: f32) -> vec3f {
+    var total_radiance = vec3f(0.0);
+    let count = u.params.w;
+    let inv_pi = 0.318309886;
+    for (var i = 0u; i < count; i++) {
+        let pl = point_lights[i];
+        let to_light = pl.position_range.xyz - hit_p;
+        let dist_sq = dot(to_light, to_light);
+        let atten = point_light_attenuation(dist_sq, pl.position_range.w);
+        if (atten <= 0.0) {
+            continue;
+        }
+        let dist = sqrt(dist_sq);
+        let light_dir = select(vec3f(0.0, 1.0, 0.0), to_light / dist, dist > 1e-4);
+        let n_dot_l = max(0.0, dot(hit_n, light_dir));
+        if (n_dot_l <= 0.0) {
+            continue;
+        }
+        var occluded = false;
+        if (dist > eps * 2.0) {
+            let shadow_hit = trace_ray(hit_p, light_dir, dist - eps);
+            occluded = (shadow_hit.tri_idx != 0xFFFFFFFFu);
+        }
+        if (!occluded) {
+            total_radiance += pl.color_intensity.rgb * (pl.color_intensity.w * atten * n_dot_l * inv_pi);
+        }
+    }
+    return total_radiance;
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let task_id = gid.x;
@@ -270,13 +417,44 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         let extent_scale = max(max(u.bounds_max.x - u.bounds_min.x, u.bounds_max.y - u.bounds_min.y), u.bounds_max.z - u.bounds_min.z);
         let eps = max(0.003, extent_scale * 0.0003);
 
+        // Primary probe-to-sky importance sample (MIS paired with cosine hemisphere sample)
+        if (u.env_params.x > 0.5 && u.env_params.w > 0.5) {
+            let eu0_1 = rand_f32(&seed);
+            let eu0_2 = rand_f32(&seed);
+            let env_s0 = sample_hdri_importance(eu0_1, eu0_2);
+            let env_dir0 = env_s0.xyz;
+            let p_env0 = env_s0.w;
+            let n_dot_env0 = dot(N, env_dir0);
+            if (p_env0 > 1e-7 && n_dot_env0 > 0.0) {
+                let sky_hit = trace_ray(p_voxel, env_dir0, 1e4);
+                if (sky_hit.tri_idx == 0xFFFFFFFFu) {
+                    let env_rad0 = sample_hdri(env_dir0);
+                    let p_cos0 = n_dot_env0 * INV_PI;
+                    let w_env0 = (p_env0 * p_env0) / max(p_env0 * p_env0 + p_cos0 * p_cos0, 1e-12);
+                    ray_rad += env_rad0 * (n_dot_env0 / p_env0) * w_env0;
+                }
+            }
+        }
+
+        var prev_bsdf_pdf = z * INV_PI;
+
         for (var b = 0u; b <= max_bounces; b++) {
             let hit = trace_ray(ray_o, cur_dir, 1e4);
             if (hit.tri_idx == 0xFFFFFFFFu) {
-                // Sky / environment light
-                let sky_grad = clamp(cur_dir.y * 0.5 + 0.5, 0.0, 1.0);
-                let sky = mix(vec3f(0.12, 0.14, 0.18), vec3f(0.35, 0.42, 0.55), sky_grad);
-                ray_rad += throughput * sky;
+                if (u.env_params.x > 0.5) {
+                    var env_rad = sample_hdri(cur_dir);
+                    if (u.env_params.w > 0.5) {
+                        let p_env = hdri_pdf(cur_dir);
+                        let w_bsdf = (prev_bsdf_pdf * prev_bsdf_pdf) / max(prev_bsdf_pdf * prev_bsdf_pdf + p_env * p_env, 1e-12);
+                        env_rad *= w_bsdf;
+                    }
+                    ray_rad += throughput * env_rad;
+                } else {
+                    // Fallback sky gradient
+                    let sky_grad = clamp(cur_dir.y * 0.5 + 0.5, 0.0, 1.0);
+                    let sky = mix(vec3f(0.12, 0.14, 0.18), vec3f(0.35, 0.42, 0.55), sky_grad);
+                    ray_rad += throughput * sky;
+                }
                 break;
             }
 
@@ -316,9 +494,33 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                 }
             }
 
-            // Subtle ambient bounce
-            let ambient_fill = vec3f(0.10, 0.12, 0.15) * (0.4 * (hit_n.y * 0.5 + 0.5));
-            ray_rad += throughput * albedo * ambient_fill;
+            // Punctual Point Lights (KHR_lights_punctual)
+            if (u.params.w > 0u) {
+                ray_rad += throughput * albedo * eval_point_lights(hit_p, hit_n, eps);
+            }
+
+            // HDRI Next Event Estimation (NEE + MIS)
+            if (u.env_params.x > 0.5 && u.env_params.w > 0.5) {
+                let eu1 = rand_f32(&seed);
+                let eu2 = rand_f32(&seed);
+                let env_s = sample_hdri_importance(eu1, eu2);
+                let env_dir = env_s.xyz;
+                let p_env = env_s.w;
+                let n_dot_env = dot(hit_n, env_dir);
+                if (p_env > 1e-7 && n_dot_env > 0.0) {
+                    let shadow_hit = trace_ray(hit_p, env_dir, 1e4);
+                    if (shadow_hit.tri_idx == 0xFFFFFFFFu) {
+                        let env_rad = sample_hdri(env_dir);
+                        let p_bsdf = n_dot_env * INV_PI;
+                        let w_nee = (p_env * p_env) / max(p_env * p_env + p_bsdf * p_bsdf, 1e-12);
+                        ray_rad += throughput * albedo * (env_rad * n_dot_env * INV_PI / p_env) * w_nee;
+                    }
+                }
+            } else if (u.env_params.x < 0.5) {
+                // Subtle fallback ambient bounce when no HDRI is active
+                let ambient_fill = vec3f(0.10, 0.12, 0.15) * (0.4 * (hit_n.y * 0.5 + 0.5));
+                ray_rad += throughput * albedo * ambient_fill;
+            }
 
             if (b == max_bounces) {
                 break;
@@ -344,6 +546,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                 break;
             }
 
+            prev_bsdf_pdf = bz * INV_PI;
             ray_o = hit_p;
             cur_dir = next_dir;
         }
@@ -397,6 +600,123 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 "#;
 
+fn create_point_lights_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    lights: &[GpuPointLight],
+    label: &str,
+) -> wgpu::Buffer {
+    let fallback = [GpuPointLight::zeroed()];
+    let slice = if lights.is_empty() { &fallback[..] } else { lights };
+    let bytes = bytemuck::cast_slice(slice);
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bytes.len() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buf, 0, bytes);
+    buf
+}
+
+struct EnvGpuResources {
+    tex_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    cdf_buf: wgpu::Buffer,
+    env_params: [f32; 4],
+    env_dims: [u32; 4],
+}
+
+fn create_env_gpu_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    env_map: Option<&EnvironmentMap>,
+    intensity: f32,
+    rotation_y_rad: f32,
+    label_prefix: &str,
+) -> EnvGpuResources {
+    let (tex_w, tex_h, tex_bytes, cdf_floats, env_params, env_dims) = if let Some(env) = env_map {
+        let mut cdf = Vec::with_capacity(env.marginal_cdf.len() + env.conditional_cdf.len());
+        cdf.extend_from_slice(&env.marginal_cdf);
+        cdf.extend_from_slice(&env.conditional_cdf);
+        let has_cdf = if env.has_importance_cdf { 1.0 } else { 0.0 };
+        (
+            env.width,
+            env.height,
+            bytemuck::cast_slice(&env.rgba16f_data).to_vec(),
+            cdf,
+            [1.0, intensity.max(0.0), rotation_y_rad, has_cdf],
+            [env.cdf_width, env.cdf_height, env.width, env.height],
+        )
+    } else {
+        let fallback_px = [0u16; 4];
+        (
+            1,
+            1,
+            bytemuck::cast_slice(&fallback_px).to_vec(),
+            vec![0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [1, 1, 1, 1],
+        )
+    };
+
+    let env_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(&format!("{label_prefix}-env-tex")),
+        size: wgpu::Extent3d {
+            width: tex_w,
+            height: tex_h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        env_tex.as_image_copy(),
+        &tex_bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(tex_w * 8),
+            rows_per_image: Some(tex_h),
+        },
+        wgpu::Extent3d {
+            width: tex_w,
+            height: tex_h,
+            depth_or_array_layers: 1,
+        },
+    );
+    let tex_view = env_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let cdf_bytes = bytemuck::cast_slice(&cdf_floats);
+    let cdf_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(&format!("{label_prefix}-env-cdf")),
+        size: cdf_bytes.len() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&cdf_buf, 0, cdf_bytes);
+
+    EnvGpuResources {
+        tex_view,
+        sampler,
+        cdf_buf,
+        env_params,
+        env_dims,
+    }
+}
+
 pub fn bake_irradiance_volume(
     gpu: &GpuContext,
     bvh: &FlatBvh,
@@ -434,13 +754,24 @@ pub fn bake_irradiance_volume(
         None => 2.8,
     };
 
+    let env_gpu = create_env_gpu_resources(
+        &gpu.device,
+        &gpu.queue,
+        settings.env_map.as_deref(),
+        settings.env_intensity,
+        settings.env_rotation_y,
+        "baker",
+    );
+
     let uniforms = BakeUniforms {
         bounds_min: [settings.bounds_min.x, settings.bounds_min.y, settings.bounds_min.z, 0.0],
         bounds_max: [settings.bounds_max.x, settings.bounds_max.y, settings.bounds_max.z, 0.0],
         resolution: [rx, ry, rz, settings.spp],
-        params: [settings.max_bounces, 1337, total_voxels, 0],
+        params: [settings.max_bounces, 1337, total_voxels, bvh.point_lights.len() as u32],
         sun_dir: [sun_d.x, sun_d.y, sun_d.z, sun_enabled],
         sun_color: [sun_col.x, sun_col.y, sun_col.z, sun_int],
+        env_params: env_gpu.env_params,
+        env_dims: env_gpu.env_dims,
     };
 
     let uniform_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -477,6 +808,13 @@ pub fn bake_irradiance_volume(
         mapped_at_creation: false,
     });
     gpu.queue.write_buffer(&mats_buf, 0, mats_bytes);
+
+    let point_lights_buf = create_point_lights_buffer(
+        &gpu.device,
+        &gpu.queue,
+        &bvh.point_lights,
+        "baker-point-lights",
+    );
 
     let output_byte_len = (total_texels * std::mem::size_of::<[f32; 4]>()) as u64;
     let output_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -608,6 +946,42 @@ pub fn bake_irradiance_volume(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -622,6 +996,10 @@ pub fn bake_irradiance_volume(
             wgpu::BindGroupEntry { binding: 4, resource: output_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&tex_view) },
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&tex_sampler) },
+            wgpu::BindGroupEntry { binding: 7, resource: point_lights_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&env_gpu.tex_view) },
+            wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(&env_gpu.sampler) },
+            wgpu::BindGroupEntry { binding: 10, resource: env_gpu.cdf_buf.as_entire_binding() },
         ],
     });
 
@@ -706,11 +1084,13 @@ pub struct ViewportPtUniforms {
     pub up: [f32; 4],
     pub bounds_min: [f32; 4],
     pub bounds_max: [f32; 4],
-    pub dims: [u32; 4],   // width, height, spp, max_bounces
-    pub params: [u32; 4], // rng_seed, mode (0=PT, 1=Raster+BakedGI), has_irradiance, pad
-    pub grid_res: [u32; 4], // rx, ry, rz, pad
-    pub sun_dir: [f32; 4],  // xyz = sun direction, w = enabled flag (1.0 or 0.0)
-    pub sun_color: [f32; 4],// rgb = sun color, w = intensity
+    pub dims: [u32; 4],      // width, height, spp, max_bounces
+    pub params: [u32; 4],    // rng_seed, mode (0=PT, 1=Raster+BakedGI), has_irradiance, pad
+    pub grid_res: [u32; 4],  // rx, ry, rz, point_light_count
+    pub sun_dir: [f32; 4],   // xyz = sun direction, w = enabled flag (1.0 or 0.0)
+    pub sun_color: [f32; 4], // rgb = sun color, w = intensity
+    pub env_params: [f32; 4], // x = enabled (1/0), y = intensity, z = rotation_y_rad, w = has_cdf (1/0)
+    pub env_dims: [u32; 4],   // cdf_width, cdf_height, tex_width, tex_height
 }
 
 #[derive(Clone, Debug)]
@@ -732,6 +1112,9 @@ pub struct ViewportPtSettings {
     pub sun_dir: Option<Vec3>,
     pub sun_color: Option<Vec3>,
     pub sun_intensity: Option<f32>,
+    pub env_map: Option<Arc<EnvironmentMap>>,
+    pub env_intensity: f32,
+    pub env_rotation_y: f32,
 }
 
 const VIEWPORT_SHADER_SRC: &str = r#"
@@ -744,9 +1127,11 @@ struct ViewportPtUniforms {
     bounds_max: vec4f,
     dims: vec4u,     // width, height, spp, max_bounces
     params: vec4u,   // rng_seed, mode, has_irradiance, pad
-    grid_res: vec4u, // rx, ry, rz, pad
+    grid_res: vec4u, // rx, ry, rz, point_light_count
     sun_dir: vec4f,
     sun_color: vec4f,
+    env_params: vec4f,
+    env_dims: vec4u,
 };
 
 struct GpuBvhNode {
@@ -782,6 +1167,11 @@ struct GpuMaterial {
     tex_index: vec4i,
 };
 
+struct GpuPointLight {
+    position_range: vec4f,  // xyz = world position, w = inverse_range_squared (0.0 if unbounded)
+    color_intensity: vec4f, // rgb = linear color, w = intensity (candela)
+};
+
 @group(0) @binding(0) var<uniform> u: ViewportPtUniforms;
 @group(0) @binding(1) var<storage, read> bvh_nodes: array<GpuBvhNode>;
 @group(0) @binding(2) var<storage, read> triangles: array<GpuTriangle>;
@@ -790,6 +1180,96 @@ struct GpuMaterial {
 @group(0) @binding(5) var tex_array: texture_2d_array<f32>;
 @group(0) @binding(6) var tex_sampler: sampler;
 @group(0) @binding(7) var<storage, read> irradiance_voxels: array<vec4f>;
+@group(0) @binding(8) var<storage, read> point_lights: array<GpuPointLight>;
+@group(0) @binding(9) var env_tex: texture_2d<f32>;
+@group(0) @binding(10) var env_sampler: sampler;
+@group(0) @binding(11) var<storage, read> env_cdf: array<f32>;
+
+const PI: f32 = 3.14159265359;
+const INV_PI: f32 = 0.31830988618;
+const TWO_PI: f32 = 6.28318530718;
+
+fn rotate_y(v: vec3f, angle: f32) -> vec3f {
+    if (abs(angle) < 1e-6) { return v; }
+    let s = sin(angle);
+    let c = cos(angle);
+    return vec3f(v.x * c + v.z * s, v.y, -v.x * s + v.z * c);
+}
+
+fn sample_hdri(world_dir: vec3f) -> vec3f {
+    let d = normalize(rotate_y(world_dir, -u.env_params.z));
+    let u_coord = atan2(d.z, d.x) / TWO_PI + 0.5;
+    let v_coord = acos(clamp(d.y, -1.0, 1.0)) * INV_PI;
+    return textureSampleLevel(env_tex, env_sampler, vec2f(u_coord, v_coord), 0.0).rgb * u.env_params.y;
+}
+
+fn hdri_pdf(world_dir: vec3f) -> f32 {
+    if (u.env_params.w < 0.5) {
+        return 0.0;
+    }
+    let cw = u.env_dims.x;
+    let ch = u.env_dims.y;
+    if (cw == 0u || ch == 0u) { return 0.0; }
+    let d = normalize(rotate_y(world_dir, -u.env_params.z));
+    let u_coord = fract(atan2(d.z, d.x) / TWO_PI + 0.5);
+    let v_coord = clamp(acos(clamp(d.y, -1.0, 1.0)) * INV_PI, 0.0, 0.999999);
+
+    let x = min(u32(floor(u_coord * f32(cw))), cw - 1u);
+    let y = min(u32(floor(v_coord * f32(ch))), ch - 1u);
+
+    let p_row = max(0.0, env_cdf[y + 1u] - env_cdf[y]);
+    let cond_base = (ch + 1u) + y * (cw + 1u);
+    let p_col = max(0.0, env_cdf[cond_base + x + 1u] - env_cdf[cond_base + x]);
+    let sin_theta = max(sqrt(max(1.0 - d.y * d.y, 0.0)), 1e-5);
+    return (p_row * p_col * f32(cw * ch)) / (2.0 * PI * PI * sin_theta);
+}
+
+fn sample_hdri_importance(u1: f32, u2: f32) -> vec4f {
+    let cw = u.env_dims.x;
+    let ch = u.env_dims.y;
+    var lo = 0u;
+    var hi = ch;
+    while (lo + 1u < hi) {
+        let mid = (lo + hi) >> 1u;
+        if (env_cdf[mid] <= u1) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let y = lo;
+    let m0 = env_cdf[y];
+    let m1 = env_cdf[y + 1u];
+    let p_row = max(0.0, m1 - m0);
+    let dy = clamp((u1 - m0) / max(p_row, 1e-8), 0.0, 0.999999);
+    let v_coord = (f32(y) + dy) / f32(ch);
+
+    let cond_base = (ch + 1u) + y * (cw + 1u);
+    var clo = 0u;
+    var chi = cw;
+    while (clo + 1u < chi) {
+        let mid = (clo + chi) >> 1u;
+        if (env_cdf[cond_base + mid] <= u2) {
+            clo = mid;
+        } else {
+            chi = mid;
+        }
+    }
+    let x = clo;
+    let c0 = env_cdf[cond_base + x];
+    let c1 = env_cdf[cond_base + x + 1u];
+    let p_col = max(0.0, c1 - c0);
+    let dx = clamp((u2 - c0) / max(p_col, 1e-8), 0.0, 0.999999);
+    let u_coord = (f32(x) + dx) / f32(cw);
+
+    let phi = (u_coord - 0.5) * TWO_PI;
+    let theta = v_coord * PI;
+    let sin_theta = sin(theta);
+    let env_dir = vec3f(sin_theta * cos(phi), cos(theta), sin_theta * sin(phi));
+    let world_dir = normalize(rotate_y(env_dir, u.env_params.z));
+    let pdf_omega = (p_row * p_col * f32(cw * ch)) / (2.0 * PI * PI * max(sin_theta, 1e-5));
+    return vec4f(world_dir, pdf_omega);
+}
 
 fn sample_face_trilinear(face: u32, stp: vec3f) -> vec3f {
     let rx = u.grid_res.x;
@@ -963,6 +1443,49 @@ fn rand_f32(seed: ptr<function, u32>) -> f32 {
     return f32(*seed) / 4294967295.0;
 }
 
+fn point_light_attenuation(dist_sq: f32, inv_range_sq: f32) -> f32 {
+    var range_falloff = 1.0;
+    if (inv_range_sq > 0.0) {
+        let factor = dist_sq * inv_range_sq;
+        if (factor >= 1.0) {
+            return 0.0;
+        }
+        let smooth_factor = clamp(1.0 - factor * factor, 0.0, 1.0);
+        range_falloff = smooth_factor * smooth_factor;
+    }
+    return range_falloff / max(dist_sq, 0.0001);
+}
+
+fn eval_point_lights(hit_p: vec3f, hit_n: vec3f, eps: f32) -> vec3f {
+    var total_radiance = vec3f(0.0);
+    let count = u.grid_res.w;
+    let inv_pi = 0.318309886;
+    for (var i = 0u; i < count; i++) {
+        let pl = point_lights[i];
+        let to_light = pl.position_range.xyz - hit_p;
+        let dist_sq = dot(to_light, to_light);
+        let atten = point_light_attenuation(dist_sq, pl.position_range.w);
+        if (atten <= 0.0) {
+            continue;
+        }
+        let dist = sqrt(dist_sq);
+        let light_dir = select(vec3f(0.0, 1.0, 0.0), to_light / dist, dist > 1e-4);
+        let n_dot_l = max(0.0, dot(hit_n, light_dir));
+        if (n_dot_l <= 0.0) {
+            continue;
+        }
+        var occluded = false;
+        if (dist > eps * 2.0) {
+            let shadow_hit = trace_ray(hit_p, light_dir, dist - eps);
+            occluded = (shadow_hit.tri_idx != 0xFFFFFFFFu);
+        }
+        if (!occluded) {
+            total_radiance += pl.color_intensity.rgb * (pl.color_intensity.w * atten * n_dot_l * inv_pi);
+        }
+    }
+    return total_radiance;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let px = gid.x;
@@ -989,8 +1512,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         var col_linear = vec3f(0.0);
 
         if (hit.tri_idx == 0xFFFFFFFFu) {
-            let bg_grad = clamp(ray_dir.y * 0.5 + 0.5, 0.0, 1.0);
-            col_linear = mix(vec3f(0.067, 0.071, 0.078), vec3f(0.09, 0.10, 0.12), bg_grad);
+            if (u.env_params.x > 0.5) {
+                col_linear = sample_hdri(ray_dir);
+            } else {
+                let bg_grad = clamp(ray_dir.y * 0.5 + 0.5, 0.0, 1.0);
+                col_linear = mix(vec3f(0.067, 0.071, 0.078), vec3f(0.09, 0.10, 0.12), bg_grad);
+            }
         } else {
             let tri = triangles[hit.tri_idx];
             let mat = materials[tri.material_idx];
@@ -1025,6 +1552,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                 }
             }
 
+            // Punctual Point Lights (KHR_lights_punctual)
+            var point_radiance = vec3f(0.0);
+            if (u.grid_res.w > 0u) {
+                point_radiance = eval_point_lights(hit_p, hit_n, eps);
+            }
+
             // Indirect Baked GI
             var indirect_gi = vec3f(0.08, 0.09, 0.11) * (hit_n.y * 0.3 + 0.7);
             if (has_irr == 1u) {
@@ -1032,7 +1565,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             }
 
             let emissive = min(mat.emissive.rgb, vec3f(15.0));
-            col_linear = emissive + albedo * (sun_radiance + indirect_gi);
+            col_linear = emissive + albedo * (sun_radiance + point_radiance + indirect_gi);
         }
 
         var col = col_linear / (col_linear + vec3f(1.0));
@@ -1063,13 +1596,24 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         var throughput = vec3f(1.0);
         var ray_rad = vec3f(0.0);
         var cur_dir = ray_dir;
+        var prev_bsdf_pdf = 0.0f;
 
         for (var b = 0u; b <= max_bounces; b++) {
             let hit = trace_ray(ray_o, cur_dir, 1e5);
             if (hit.tri_idx == 0xFFFFFFFFu) {
-                let bg_grad = clamp(cur_dir.y * 0.5 + 0.5, 0.0, 1.0);
-                let bg = mix(vec3f(0.067, 0.071, 0.078), vec3f(0.09, 0.10, 0.12), bg_grad);
-                ray_rad += throughput * bg;
+                if (u.env_params.x > 0.5) {
+                    var env_rad = sample_hdri(cur_dir);
+                    if (b > 0u && u.env_params.w > 0.5) {
+                        let p_env = hdri_pdf(cur_dir);
+                        let w_bsdf = (prev_bsdf_pdf * prev_bsdf_pdf) / max(prev_bsdf_pdf * prev_bsdf_pdf + p_env * p_env, 1e-12);
+                        env_rad *= w_bsdf;
+                    }
+                    ray_rad += throughput * env_rad;
+                } else {
+                    let bg_grad = clamp(cur_dir.y * 0.5 + 0.5, 0.0, 1.0);
+                    let bg = mix(vec3f(0.067, 0.071, 0.078), vec3f(0.09, 0.10, 0.12), bg_grad);
+                    ray_rad += throughput * bg;
+                }
                 break;
             }
 
@@ -1108,6 +1652,30 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                 }
             }
 
+            // Punctual Point Lights (KHR_lights_punctual)
+            if (u.grid_res.w > 0u) {
+                ray_rad += throughput * albedo * eval_point_lights(hit_p, hit_n, eps);
+            }
+
+            // HDRI Next Event Estimation (NEE + MIS)
+            if (u.env_params.x > 0.5 && u.env_params.w > 0.5) {
+                let eu1 = rand_f32(&seed);
+                let eu2 = rand_f32(&seed);
+                let env_s = sample_hdri_importance(eu1, eu2);
+                let env_dir = env_s.xyz;
+                let p_env = env_s.w;
+                let n_dot_env = dot(hit_n, env_dir);
+                if (p_env > 1e-7 && n_dot_env > 0.0) {
+                    let shadow_hit = trace_ray(hit_p, env_dir, 1e5);
+                    if (shadow_hit.tri_idx == 0xFFFFFFFFu) {
+                        let env_rad = sample_hdri(env_dir);
+                        let p_bsdf = n_dot_env * INV_PI;
+                        let w_nee = (p_env * p_env) / max(p_env * p_env + p_bsdf * p_bsdf, 1e-12);
+                        ray_rad += throughput * albedo * (env_rad * n_dot_env * INV_PI / p_env) * w_nee;
+                    }
+                }
+            }
+
             if (b == max_bounces) {
                 break;
             }
@@ -1132,6 +1700,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                 break;
             }
 
+            prev_bsdf_pdf = bz * INV_PI;
             ray_o = hit_p;
             cur_dir = next_dir;
         }
@@ -1173,6 +1742,15 @@ pub fn render_viewport_pt(
         None => 2.8,
     };
 
+    let env_gpu = create_env_gpu_resources(
+        &gpu.device,
+        &gpu.queue,
+        settings.env_map.as_deref(),
+        settings.env_intensity,
+        settings.env_rotation_y,
+        "vp",
+    );
+
     let uniforms = ViewportPtUniforms {
         eye: [settings.eye.x, settings.eye.y, settings.eye.z, 0.0],
         forward: [settings.forward.x, settings.forward.y, settings.forward.z, 0.0],
@@ -1182,9 +1760,11 @@ pub fn render_viewport_pt(
         bounds_max: [settings.bounds_max.x, settings.bounds_max.y, settings.bounds_max.z, 0.0],
         dims: [width, height, settings.spp, settings.max_bounces],
         params: [settings.seed, settings.mode, has_irr, 0],
-        grid_res: [settings.resolution.x, settings.resolution.y, settings.resolution.z, 0],
+        grid_res: [settings.resolution.x, settings.resolution.y, settings.resolution.z, bvh.point_lights.len() as u32],
         sun_dir: [sun_d.x, sun_d.y, sun_d.z, sun_enabled],
         sun_color: [sun_col.x, sun_col.y, sun_col.z, sun_int],
+        env_params: env_gpu.env_params,
+        env_dims: env_gpu.env_dims,
     };
 
     let uniform_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1296,6 +1876,13 @@ pub fn render_viewport_pt(
     });
     gpu.queue.write_buffer(&irradiance_buf, 0, irradiance_bytes);
 
+    let point_lights_buf = create_point_lights_buffer(
+        &gpu.device,
+        &gpu.queue,
+        &bvh.point_lights,
+        "vp-point-lights",
+    );
+
     let shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("vp-pt-shader"),
         source: wgpu::ShaderSource::Wgsl(VIEWPORT_SHADER_SRC.into()),
@@ -1380,6 +1967,42 @@ pub fn render_viewport_pt(
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 11,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -1395,6 +2018,10 @@ pub fn render_viewport_pt(
             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&tex_view) },
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&tex_sampler) },
             wgpu::BindGroupEntry { binding: 7, resource: irradiance_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: point_lights_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&env_gpu.tex_view) },
+            wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::Sampler(&env_gpu.sampler) },
+            wgpu::BindGroupEntry { binding: 11, resource: env_gpu.cdf_buf.as_entire_binding() },
         ],
     });
 
@@ -1513,6 +2140,9 @@ mod tests {
             sun_dir: scene.directional_light.as_ref().map(|s| s.direction),
             sun_color: scene.directional_light.as_ref().map(|s| s.color),
             sun_intensity: scene.directional_light.as_ref().map(|s| s.intensity),
+            env_map: None,
+            env_intensity: 1.0,
+            env_rotation_y: 0.0,
         };
         let res = render_viewport_pt(&gpu, &bvh, &settings);
         match res {
@@ -1536,6 +2166,377 @@ mod tests {
                 panic!("render_viewport_pt FAILED: {:#}", e);
             }
         }
+    }
+
+    fn make_quad_tris(center: Vec3, half_size: f32, normal_y: f32) -> [crate::scene::Triangle; 2] {
+        let n = Vec3::new(0.0, normal_y, 0.0);
+        let p0 = center + Vec3::new(-half_size, 0.0, -half_size);
+        let p1 = center + Vec3::new(half_size, 0.0, -half_size);
+        let p2 = center + Vec3::new(half_size, 0.0, half_size);
+        let p3 = center + Vec3::new(-half_size, 0.0, half_size);
+        let mk = |a: Vec3, b: Vec3, c: Vec3| crate::scene::Triangle {
+            p0: a,
+            p1: b,
+            p2: c,
+            n0: n,
+            n1: n,
+            n2: n,
+            uv0: [0.0, 0.0],
+            uv1: [1.0, 0.0],
+            uv2: [1.0, 1.0],
+            material_id: 0,
+        };
+        [mk(p0, p1, p2), mk(p0, p2, p3)]
+    }
+
+    fn build_synthetic_point_light_scene(
+        with_occluder: bool,
+        point_lights: Vec<crate::scene::PointLightData>,
+    ) -> crate::scene::Scene {
+        let mut triangles = Vec::new();
+        triangles.extend_from_slice(&make_quad_tris(Vec3::ZERO, 4.0, 1.0));
+        if with_occluder {
+            triangles.extend_from_slice(&make_quad_tris(Vec3::new(0.0, 1.0, 0.0), 0.75, 1.0));
+        }
+        let mut mat = crate::scene::Material::default();
+        mat.base_color = glam::Vec4::new(0.8, 0.8, 0.8, 1.0);
+        crate::scene::Scene {
+            triangles,
+            materials: vec![mat],
+            texture_array: vec![255, 255, 255, 255],
+            texture_slices: 1,
+            texture_size: 1,
+            bounds_min: Vec3::new(-4.0, -0.5, -4.0),
+            bounds_max: Vec3::new(4.0, 3.0, 4.0),
+            directional_light: None,
+            point_lights,
+        }
+    }
+
+    #[test]
+    fn test_point_light_bake_pt_occlusion_and_range() {
+        let gpu = match GpuContext::new_dx12() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("DX12 init failed: {e:#}");
+                return;
+            }
+        };
+
+        let lit_scene = build_synthetic_point_light_scene(
+            false,
+            vec![crate::scene::PointLightData {
+                position: Vec3::new(0.0, 2.0, 0.0),
+                color: Vec3::new(1.0, 0.5, 0.25),
+                intensity: 100.0,
+                range: None,
+            }],
+        );
+        let unlit_scene = build_synthetic_point_light_scene(false, vec![]);
+        let occluded_scene = build_synthetic_point_light_scene(
+            true,
+            vec![crate::scene::PointLightData {
+                position: Vec3::new(0.0, 2.0, 0.0),
+                color: Vec3::new(1.0, 0.5, 0.25),
+                intensity: 100.0,
+                range: None,
+            }],
+        );
+        let out_of_range_scene = build_synthetic_point_light_scene(
+            false,
+            vec![crate::scene::PointLightData {
+                position: Vec3::new(0.0, 2.0, 0.0),
+                color: Vec3::new(1.0, 0.5, 0.25),
+                intensity: 100.0,
+                range: Some(1.5),
+            }],
+        );
+
+        let lit_bvh = FlatBvh::build(&lit_scene);
+        let unlit_bvh = FlatBvh::build(&unlit_scene);
+        let occluded_bvh = FlatBvh::build(&occluded_scene);
+        let range_bvh = FlatBvh::build(&out_of_range_scene);
+        assert_eq!(lit_bvh.point_lights.len(), 1);
+        assert_eq!(unlit_bvh.point_lights.len(), 0);
+
+        let bake_settings = BakeSettings {
+            resolution: UVec3::new(2, 2, 2),
+            bounds_min: Vec3::new(-2.0, 0.1, -2.0),
+            bounds_max: Vec3::new(2.0, 2.5, 2.0),
+            spp: 16,
+            max_bounces: 1,
+            sun_dir: None,
+            sun_color: None,
+            sun_intensity: None,
+            env_map: None,
+            env_intensity: 1.0,
+            env_rotation_y: 0.0,
+        };
+        let lit_bake = bake_irradiance_volume(&gpu, &lit_bvh, &bake_settings).unwrap();
+        let unlit_bake = bake_irradiance_volume(&gpu, &unlit_bvh, &bake_settings).unwrap();
+        let sum_r = |res: &BakeResult| -> f32 { res.raw_floats.iter().map(|v| v[0]).sum() };
+        assert!(
+            sum_r(&lit_bake) > sum_r(&unlit_bake) * 2.0,
+            "Point light should significantly increase baked irradiance: lit={}, unlit={}",
+            sum_r(&lit_bake),
+            sum_r(&unlit_bake)
+        );
+
+        // Camera looking down at (0, 0, 0) from (0, 5, 5)
+        let eye = Vec3::new(0.0, 3.0, 4.0);
+        let forward = (Vec3::ZERO - eye).normalize();
+        let right = forward.cross(Vec3::Y).normalize();
+        let up = right.cross(forward).normalize();
+        let vp_settings = |mode: u32| ViewportPtSettings {
+            eye,
+            forward,
+            right,
+            up,
+            width: 32,
+            height: 32,
+            spp: 2,
+            max_bounces: 1,
+            seed: 42,
+            mode,
+            bounds_min: bake_settings.bounds_min,
+            bounds_max: bake_settings.bounds_max,
+            resolution: bake_settings.resolution,
+            irradiance_voxels: None,
+            sun_dir: None,
+            sun_color: None,
+            sun_intensity: None,
+            env_map: None,
+            env_intensity: 1.0,
+            env_rotation_y: 0.0,
+        };
+
+        let center_px = |pixels: &[u8]| -> [u8; 3] {
+            let idx = (16 * 32 + 16) * 4;
+            [pixels[idx], pixels[idx + 1], pixels[idx + 2]]
+        };
+
+        // Mode 0 (Pathtracer) & Mode 1 (Raster + Baked GI): lit > unlit, occluded shadowed, range=1.5 cut off
+        for mode in [0u32, 1u32] {
+            let lit_px = render_viewport_pt(&gpu, &lit_bvh, &vp_settings(mode)).unwrap();
+            let unlit_px = render_viewport_pt(&gpu, &unlit_bvh, &vp_settings(mode)).unwrap();
+            let occ_px = render_viewport_pt(&gpu, &occluded_bvh, &vp_settings(mode)).unwrap();
+            let rng_px = render_viewport_pt(&gpu, &range_bvh, &vp_settings(mode)).unwrap();
+
+            let lc = center_px(&lit_px);
+            let uc = center_px(&unlit_px);
+            let rc = center_px(&rng_px);
+            assert!(
+                lc[0] > uc[0] + 40 && lc[0] > lc[2],
+                "mode {mode}: warm point light should brighten center pixel: lit={lc:?}, unlit={uc:?}"
+            );
+            assert_eq!(
+                rc, uc,
+                "mode {mode}: point light with range=1.5 at dist=2.0 should attenuate to zero: rng={rc:?}, unlit={uc:?}"
+            );
+            // At pixel (16, 26) (lower on screen = front of floor outside occluder? check center under occluder vs unlit)
+            let oc = center_px(&occ_px);
+            assert!(
+                oc[0] < lc[0],
+                "mode {mode}: occluder should reduce luminance vs unoccluded lit floor: occ={oc:?}, lit={lc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cubes_glb_point_light_bake_and_pt() {
+        let gpu = match GpuContext::new_dx12() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("DX12 init failed: {e:#}");
+                return;
+            }
+        };
+        let path = std::path::Path::new("C:/tracer-experiment/mutbaker-gui/assets/models/cubes/Cubes.glb");
+        if !path.exists() {
+            eprintln!("Path not found: {:?}", path);
+            return;
+        }
+        let scene = crate::scene::Scene::load_gltf(path).expect("load Cubes.glb");
+        assert_eq!(scene.point_lights.len(), 1, "Cubes.glb should contain 1 point light");
+        let bvh = FlatBvh::build(&scene);
+        assert_eq!(bvh.point_lights.len(), 1);
+
+        let bake = bake_irradiance_volume(
+            &gpu,
+            &bvh,
+            &BakeSettings {
+                resolution: UVec3::new(4, 4, 4),
+                bounds_min: scene.bounds_min,
+                bounds_max: scene.bounds_max,
+                spp: 16,
+                max_bounces: 2,
+                sun_dir: None,
+                sun_color: None,
+                sun_intensity: None,
+                env_map: None,
+                env_intensity: 1.0,
+                env_rotation_y: 0.0,
+            },
+        )
+        .expect("bake Cubes.glb");
+        let max_irr = bake
+            .raw_floats
+            .iter()
+            .fold(0.0f32, |acc, v| acc.max(v[0]).max(v[1]).max(v[2]));
+        assert!(max_irr > 0.5, "Cubes.glb point light should bake significant irradiance, got {max_irr}");
+
+        let eye = Vec3::new(8.0, 5.0, 8.0);
+        let forward = (Vec3::new(0.0, 1.5, 0.0) - eye).normalize();
+        let right = forward.cross(Vec3::Y).normalize();
+        let up = right.cross(forward).normalize();
+        let pixels = render_viewport_pt(
+            &gpu,
+            &bvh,
+            &ViewportPtSettings {
+                eye,
+                forward,
+                right,
+                up,
+                width: 128,
+                height: 128,
+                spp: 2,
+                max_bounces: 2,
+                seed: 7,
+                mode: 0,
+                bounds_min: scene.bounds_min,
+                bounds_max: scene.bounds_max,
+                resolution: UVec3::new(4, 4, 4),
+                irradiance_voxels: None,
+                sun_dir: None,
+                sun_color: None,
+                sun_intensity: None,
+                env_map: None,
+                env_intensity: 1.0,
+                env_rotation_y: 0.0,
+            },
+        )
+        .expect("render Cubes.glb PT");
+        let non_black = pixels.chunks(4).filter(|p| p[0] > 10 || p[1] > 10 || p[2] > 10).count();
+        assert!(non_black > 100, "Expected lit pixels in Cubes.glb PT preview, got {non_black}");
+    }
+
+    #[test]
+    fn test_hdri_bake_directionality_rotation_and_pt() {
+        let gpu = match GpuContext::new_dx12() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("DX12 init failed: {e:#}");
+                return;
+            }
+        };
+
+        // Create a synthetic 16x8 equirectangular HDRI with a very bright warm light at u=0.5 (+X)
+        // since phi = (u - 0.5) * 2*PI => u=0.5 => phi=0 => dir = (+1, 0, 0) at v=0.5.
+        let w = 16u32;
+        let h = 8u32;
+        let mut pixels = vec![[0.02f32, 0.02, 0.04]; (w * h) as usize];
+        for y in 3..=4 {
+            for x in 7..=8 {
+                pixels[(y * w + x) as usize] = [40.0, 12.0, 2.0];
+            }
+        }
+        let env = Arc::new(EnvironmentMap::from_rgb_f32("sun_px.hdr", w, h, &pixels).unwrap());
+
+        let scene = build_synthetic_point_light_scene(false, vec![]);
+        let bvh = FlatBvh::build(&scene);
+
+        let bake_0 = bake_irradiance_volume(
+            &gpu,
+            &bvh,
+            &BakeSettings {
+                resolution: UVec3::new(1, 1, 1),
+                bounds_min: Vec3::new(-0.5, 1.0, -0.5),
+                bounds_max: Vec3::new(0.5, 2.0, 0.5),
+                spp: 32,
+                max_bounces: 1,
+                sun_dir: None,
+                sun_color: None,
+                sun_intensity: None,
+                env_map: Some(env.clone()),
+                env_intensity: 1.0,
+                env_rotation_y: 0.0,
+            },
+        )
+        .expect("HDRI bake rot 0");
+
+        // Layout for 1x1x1 (1x2x3 texels):
+        // +X: (0, 0, 0) -> idx 0
+        // -X: (0, 1, 0) -> idx 1
+        let px_0 = bake_0.raw_floats[0];
+        let nx_0 = bake_0.raw_floats[1];
+        assert!(
+            px_0[0] > nx_0[0] * 4.0 && px_0[0] > px_0[2] * 2.0,
+            "HDRI at +X should strongly light +X face with warm color: +X={px_0:?}, -X={nx_0:?}"
+        );
+
+        let bake_rot_pi = bake_irradiance_volume(
+            &gpu,
+            &bvh,
+            &BakeSettings {
+                resolution: UVec3::new(1, 1, 1),
+                bounds_min: Vec3::new(-0.5, 1.0, -0.5),
+                bounds_max: Vec3::new(0.5, 2.0, 0.5),
+                spp: 32,
+                max_bounces: 1,
+                sun_dir: None,
+                sun_color: None,
+                sun_intensity: None,
+                env_map: Some(env.clone()),
+                env_intensity: 1.0,
+                env_rotation_y: std::f32::consts::PI,
+            },
+        )
+        .expect("HDRI bake rot PI");
+
+        let px_pi = bake_rot_pi.raw_floats[0];
+        let nx_pi = bake_rot_pi.raw_floats[1];
+        assert!(
+            nx_pi[0] > px_pi[0] * 4.0 && nx_pi[0] > nx_pi[2] * 2.0,
+            "Rotating HDRI by PI should move bright patch to -X face: +X={px_pi:?}, -X={nx_pi:?}"
+        );
+
+        // Verify Viewport PT renders HDRI background and floor illumination
+        let eye = Vec3::new(0.0, 1.5, 3.0);
+        let forward = (Vec3::new(0.0, 0.8, 0.0) - eye).normalize();
+        let right = forward.cross(Vec3::Y).normalize();
+        let up = right.cross(forward).normalize();
+        let pt_pixels = render_viewport_pt(
+            &gpu,
+            &bvh,
+            &ViewportPtSettings {
+                eye,
+                forward,
+                right,
+                up,
+                width: 64,
+                height: 64,
+                spp: 8,
+                max_bounces: 1,
+                seed: 1,
+                mode: 0,
+                bounds_min: scene.bounds_min,
+                bounds_max: scene.bounds_max,
+                resolution: UVec3::new(2, 2, 2),
+                irradiance_voxels: None,
+                sun_dir: None,
+                sun_color: None,
+                sun_intensity: None,
+                env_map: Some(env),
+                env_intensity: 1.0,
+                env_rotation_y: 0.0,
+            },
+        )
+        .expect("HDRI viewport PT");
+        let warm_floor = pt_pixels
+            .chunks(4)
+            .filter(|p| p[0] > p[2] + 20 && p[0] > 80)
+            .count();
+        assert!(warm_floor > 50, "Expected warm HDRI-lit pixels in PT preview, got {warm_floor}");
     }
 }
 

@@ -34,6 +34,9 @@ mutracer-native verify-ktx2 <path.ktx2>
 | `--spp` | 每个立方体方向的采样光线数 | `--spp 64` | `64` |
 | `--bounces` | 最大漫反射弹射反弹深度 | `--bounces 2` | `2` |
 | `--bounds` | 自定义包围盒 $(minX,minY,minZ,maxX,maxY,maxZ)$ | `--bounds -5,0,-5,5,5,5` | 自动根据场景 AABB + 5% 扩展 |
+| `--hdri` | 指定等距柱状投影（Equirectangular）`.hdr` 环境贴图路径| `--hdri path.hdr` | 无（不启用 HDRI，使用默认渐变天空） |
+| `--hdri-intensity` | HDRI 亮度/强度倍率（线性倍率，如 `0.5`、`1.5`）| `--hdri-intensity val` | `1.0` |
+| `--hdri-rotation` | 绕世界 Y 轴旋转角度（单位：度，如 `45`、`90`、`180`）| `--hdri-rotation deg` | `0.0` |
 
 #### 产物输出
 每次烘焙完成会自动输出两个文件：
